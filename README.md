@@ -9,9 +9,16 @@ from [LTX Alpha Gen OFX for Flame](https://github.com/flamelogik/Flame_LTXAlphaG
 by Jan Klier, maintained by [Logik.tv](https://logik.tv). This is an independent
 port, not made or endorsed by Lightricks or Blackmagic Design.
 
+## Download
+
+### [Download the installer: LTXAlphaGen-1.44.pkg](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.44/LTXAlphaGen-1.44.pkg)
+
+### [Download the guide (PDF)](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.44/LTX_Alpha_Gen_Guide.pdf)
+
+These links download the files straight away. You won't find the installer in the list of code files above: GitHub keeps it on the [Releases page](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/latest), under **Assets**. The installer is only the plugin, and you also need to [download the models](#setup-download-the-models).
+
 ![The first, middle and last matte of a shot of a circular saw and an arm](fusion_studio_first_mattes.png)
 
-**Full guide (PDF):** [LTX_Alpha_Gen_Guide.pdf](LTX_Alpha_Gen_Guide.pdf) has the full steps, with screenshots of the controls and node setups. It prints well in grayscale.
 
 ## Is it for you?
 
@@ -37,8 +44,7 @@ port, not made or endorsed by Lightricks or Blackmagic Design.
 
 ## Install
 
-1. Download `LTXAlphaGen-<version>.pkg` from the latest
-   [Release](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/latest).
+1. [Download the installer](#download) from the top of this page.
 2. Quit Resolve and Fusion Studio, then double-click the pkg. It is signed and
    notarized, asks for your admin password, and installs into
    `/Library/OFX/Plugins`.
