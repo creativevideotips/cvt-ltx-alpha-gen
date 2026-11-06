@@ -11,9 +11,9 @@ port, not made or endorsed by Lightricks or Blackmagic Design.
 
 ## Download
 
-### [Download the installer: LTXAlphaGen-1.44.pkg](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.44/LTXAlphaGen-1.44.pkg)
+### [Download the installer: LTXAlphaGen-1.45.pkg](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.45/LTXAlphaGen-1.45.pkg)
 
-### [Download the guide (PDF)](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.44/LTX_Alpha_Gen_Guide.pdf)
+### [Download the guide (PDF)](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.45/LTX_Alpha_Gen_Guide.pdf)
 
 These links download the files straight away. You won't find the installer in the list of code files above: GitHub keeps it on the [Releases page](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/latest), under **Assets**. The installer is only the plugin, and you also need to [download the models](#setup-download-the-models).
 
@@ -26,6 +26,8 @@ These links download the files straight away. You won't find the installer in th
   When its matte isn't good enough, use LTX Alpha Gen for the more precise work.
 - **Mac with Apple Silicon only.** It runs the model on the Mac's GPU. There is
   no Windows, Linux or NVIDIA version.
+- **macOS 15 (Sequoia) or later.** The plugin is built for macOS 15, and the installer
+  will not install on an older macOS.
 - **Tested with Resolve Studio and Fusion Studio.** It has not yet been tested in the
   free version of Resolve. Magic Mask is Studio-only, but any roto or garbage matte
   works for [Guided ROI](#choosing-the-subject-guided-roi).

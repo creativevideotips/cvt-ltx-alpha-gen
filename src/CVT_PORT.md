@@ -309,3 +309,6 @@ about Flame, Linux or NVIDIA, that part does not apply here.
   carries file metadata (EXIF and XMP held the Mac's user name).
 - cvt1.44: the installer package no longer contains compiled Python caches, which carried the path
   of the Mac that built it. No change to the plugin itself.
+- cvt1.45: the installer refuses to install on a Mac older than macOS 15 (the plugin is built for macOS 15,
+  and macOS won't load it on an older system, so before this it installed and then simply didn't appear),
+  and the README, guide and installer Read Me now say macOS 15 or later. No change to the plugin itself.
