@@ -159,6 +159,10 @@ constexpr const char* kPDownload = "download";
 // [Models] — per user.
 constexpr const char* kPModelDir = "modelDir";
 constexpr const char* kPExistingDir = "existingModels";
+constexpr const char* kPLinkExisting = "linkExisting";
+constexpr const char* kPChooseExisting = "chooseExistingModels";
+constexpr const char* kPChooseModel = "chooseModelFolder";
+constexpr const char* kPChooseCache = "chooseCacheFolder";
 constexpr const char* kPSetupStatus = "setupStatus";
 constexpr const char* kPDebugLog = "debugLogging";
 constexpr const char* kPCollectLogs = "collectLogs";
@@ -294,6 +298,18 @@ std::string licenceHash() {
   std::snprintf(b, sizeof b, "%016llx",
                 static_cast<unsigned long long>(fnv(readFile(licencePath()))));
   return b;
+}
+
+// The Model Folder LTX Inpaint Still was set up with, "" if it hasn't been. They share the models.
+std::string inpaintStillModelFolder() {
+  std::ifstream in(homeDir() + "/.config/ltx-inpaint-still/config.conf");
+  std::string line;
+  while (std::getline(in, line))
+    if (line.rfind("model_dir=", 0) == 0) {
+      struct stat st {};
+      return stat(line.c_str() + 10, &st) == 0 ? line.substr(10) : "";
+    }
+  return "";
 }
 
 struct SetupState {
@@ -592,6 +608,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     token_ = fetchStringParam(kPToken);
     modelDir_ = fetchStringParam(kPModelDir);
     existingDir_ = fetchStringParam(kPExistingDir);
+    linkExisting_ = fetchBooleanParam(kPLinkExisting);
     setupStatus_ = fetchStringParam(kPSetupStatus);
     debugLog_ = fetchBooleanParam(kPDebugLog);
     cacheDir_ = fetchStringParam(kPCacheDir);
@@ -652,7 +669,17 @@ class AlphaGenEffect : public OFX::ImageEffect {
       // Per-user values are not stored in setups; mirror them from the user config.
       const UserConfig cfg = loadUserConfig();
       accept_->setValue(setupState().licenceAccepted);
-      if (cfg.count("model_dir")) modelDir_->setValue(cfg.at("model_dir"));
+      // cvt1.46: someone who set up LTX Inpaint Still first keeps that one folder for both.
+      // cvt1.49: a folder that was set up and has since been deleted is left over, not a choice. A folder on
+      // a drive that's away may come back, and one typed in but not made yet is made by Setup.
+      struct stat modelStat {};
+      const std::string ownModels = cfg.count("model_dir") ? cfg.at("model_dir") : "";
+      const bool leftOver = !ownModels.empty() && cfg.count("models_ready") && stat(ownModels.c_str(), &modelStat) != 0 &&
+                            ownModels.rfind("/Volumes/", 0) != 0;
+      const std::string otherModels = ownModels.empty() || leftOver ? inpaintStillModelFolder() : "";
+      if (!ownModels.empty() && !leftOver) modelDir_->setValue(ownModels);
+      else if (!otherModels.empty()) modelDir_->setValue(otherModels);
+      else if (leftOver) modelDir_->setValue(homeDir() + "/LTX-2.5");
       if (cfg.count("existing_models")) existingDir_->setValue(cfg.at("existing_models"));
       cacheDir_->setValue(cacheSettings(cfg).root);
       cacheLimit_->setValue(cacheSettings(cfg).capGB);  // cvt1.14: per user, like the folder
@@ -668,6 +695,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     LogScope scope(nodeId_);
     stopWatcher();
     stopSetupWatcher();
+    stopChoosingFolder();
     LOGI("destroyInstance %p", static_cast<void*>(this));
   }
 
@@ -774,6 +802,68 @@ class AlphaGenEffect : public OFX::ImageEffect {
   // cvt1.38: Resolve's Edit and Color pages give the output clip a frame range ([0,10] on an
   // 11-frame clip); the Fusion page and Fusion Studio give none ([0,-1]).
   // Open a web page in the default browser (cvt1.39: shared by the page buttons).
+  // The Mac's own folder picker. Fusion's browse control for a folder field only picks files. It runs on its
+  // own thread so the host keeps drawing while the window is open, and Cancel changes nothing.
+  void chooseFolder(OFX::StringParam* field, const char* prompt, const char* configKey) {
+    if (browsing_.exchange(true)) return;
+    if (browseThread_.joinable()) browseThread_.join();
+    std::string start;
+    field->getValue(start);
+    struct stat st {};
+    if (start.empty() || start[0] != '/' || stat(start.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) start = homeDir();
+    const std::string node = nodeId_, title = prompt, key = configKey;
+    browseThread_ = std::thread([this, field, node, title, start, key] {
+      LogScope scope(node);
+      auto proc = std::make_shared<WorkerProcess>();
+      {
+        std::lock_guard<std::mutex> lock(browseMutex_);
+        browseProc_ = proc;
+      }
+      std::string err;
+      std::vector<std::string> lines;
+      if (proc->start({"/usr/bin/osascript", "-e", "on run argv", "-e", "activate", "-e",
+                       "return POSIX path of (choose folder with prompt (item 1 of argv) default location "
+                       "(POSIX file (item 2 of argv) as alias))",
+                       "-e", "end run", title, start},
+                      cleanEnvironment(), err)) {
+        while (proc->readLines(200, lines)) {
+        }
+        proc->wait();
+      } else {
+        LOGW("choose folder: %s", err.c_str());
+      }
+      {
+        std::lock_guard<std::mutex> lock(browseMutex_);
+        browseProc_.reset();
+      }
+      std::string chosen = lines.empty() ? "" : lines.front();
+      while (chosen.size() > 1 && chosen.back() == '/') chosen.pop_back();
+      if (!chosen.empty() && chosen[0] == '/') {
+        try {
+          field->setValue(chosen);
+          if (!key.empty()) {  // a change made here isn't a user edit, so it is saved here
+            UserConfig cfg = loadUserConfig();
+            cfg[key] = chosen;
+            saveUserConfig(cfg);
+          }
+          refreshSetupUi();
+          refreshCacheInfo();
+        } catch (const std::exception& e) {
+          LOGE("choose folder: %s", e.what());
+        }
+      }
+      browsing_ = false;
+    });
+  }
+
+  void stopChoosingFolder() {
+    {
+      std::lock_guard<std::mutex> lock(browseMutex_);
+      if (browseProc_) browseProc_->kill();
+    }
+    if (browseThread_.joinable()) browseThread_.join();
+  }
+
   void openPage(const char* url) {
     std::string err;
     if (launchDetached({"/usr/bin/open", url}, cleanEnvironment(), err))
@@ -1271,6 +1361,12 @@ class AlphaGenEffect : public OFX::ImageEffect {
       }
       saveUserConfig(cfg);
       LOGI("licence %s (hash %s)", v ? "accepted" : "withdrawn", licenceHash().c_str());
+    } else if (name == kPChooseExisting) {
+      chooseFolder(existingDir_, "Choose a folder that has the model files", "existing_models");
+    } else if (name == kPChooseModel) {
+      chooseFolder(modelDir_, "Choose the folder for the LTX-2.5 models", "model_dir");
+    } else if (name == kPChooseCache) {
+      chooseFolder(cacheDir_, "Choose the cache folder", "cache_dir");
     } else if (name == kPModelDir || name == kPCacheDir || name == kPExistingDir) {
       std::string v;
       (name == kPModelDir ? modelDir_ : name == kPCacheDir ? cacheDir_ : existingDir_)->getValue(v);
@@ -1343,7 +1439,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     const bool hide = st.ready() && !showSetup;
     if (hostIsBlackmagic() && hide != setupHidden_) {
       for (const char* p : {kPViewLicence, kPAccept, kPModelPage, kPLoraPage, kPTokenPage, kPToken,
-                            kPDownload, kPExistingDir}) {
+                            kPDownload, kPExistingDir, kPLinkExisting, kPChooseExisting}) {
         try {
           getParam(p)->setIsSecret(hide);
         } catch (const std::exception& e) {
@@ -2176,8 +2272,8 @@ class AlphaGenEffect : public OFX::ImageEffect {
     existingDir_->getValue(existing);
     dir = trimSlashes(dir);
     existing = trimSlashes(existing);
-    LOGI("download pressed: licence=%d token length=%zu model dir=%s existing=%s",
-         int(setupState().licenceAccepted), token.size(), dir.c_str(), existing.c_str());
+    LOGI("download pressed: licence=%d token %s model dir=%s existing=%s",
+         int(setupState().licenceAccepted), token.empty() ? "none" : "given", dir.c_str(), existing.c_str());
     if (!setupState().licenceAccepted)
       return error("Accept the LTX-2 Community License before downloading.");
     // cvt1.42: before the token is used and cleared, so it is still there for the next try.
@@ -2192,17 +2288,10 @@ class AlphaGenEffect : public OFX::ImageEffect {
                                      "--cache-root", cacheRoot()};
     if (!existing.empty()) {
       argv.insert(argv.end(), {"--existing", existing});
-      // Decision 66: link to the existing files instead of copying them. Asked each time; a host
-      // that doesn't answer (neither Yes nor No) gets the copy, as before.
-      const OFX::Message::MessageReplyEnum reply = sendMessage(
-          OFX::Message::eMessageQuestion, "",
-          "Link to the model files found in Existing Models instead of copying them?\n\n"
-          "Yes: link (saves up to 73 GB). The Existing Models folder must then stay where it is "
-          "and stay available; on a network folder every model load is slower.\n\n"
-          "No: copy them into the Model Folder (independent of the original files).\n\n"
-          "Either way each file is checked against its expected checksum first.");
-      const bool link = reply == OFX::Message::eMessageReplyYes;
-      LOGI("download: link instead of copy? reply %d -> %s", int(reply), link ? "link" : "copy");
+      // Decision 66: link to the existing files instead of copying them. cvt1.47: a checkbox, because
+      // Fusion never showed the question this used to ask, so it always copied.
+      bool link = false;
+      linkExisting_->getValue(link);
       if (link) argv.push_back("--link");
     }
     const std::string level = logLevel() == LogLevel::Debug ? "debug" : "info";
@@ -2276,6 +2365,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
   OFX::StringParam* token_;
   OFX::StringParam* modelDir_;
   OFX::StringParam* existingDir_;
+  OFX::BooleanParam* linkExisting_;
   OFX::StringParam* setupStatus_;
   OFX::BooleanParam* debugLog_;
   OFX::StringParam* cacheDir_;
@@ -2316,6 +2406,10 @@ class AlphaGenEffect : public OFX::ImageEffect {
   std::string lastDeliveredCs_;  // render logs the delivered colourspace when it changes
   std::thread watcher_;
   std::thread setupWatcher_;
+  std::thread browseThread_;
+  std::atomic<bool> browsing_{false};
+  std::mutex browseMutex_;
+  std::shared_ptr<WorkerProcess> browseProc_;
   std::atomic<bool> setupStop_{false};
   bool gateWasClosed_ = false;  // render: refresh the Setup UI once Setup has completed
   std::atomic<bool> stopFlag_{false};
@@ -2702,10 +2796,11 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     auto* gCache = group("grpCache", "Cache", main, false);
     auto* cdir = labelled(desc.defineStringParam(kPCacheDir), "Cache Folder",
                           "Where generated mattes are cached (about 4 MB per HD frame).");
-    cdir->setStringType(OFX::eStringTypeDirectoryPath);
+    cdir->setStringType(OFX::eStringTypeSingleLine);  // cvt1.48: a Choose button replaces Fusion's browse, which only picks files
     cdir->setDefault(homeDir() + "/.cache/ltx-alphagen/mattes");
     perUser(cdir);
     place(*cdir, gCache);
+    place(*button(kPChooseCache, "Choose Cache Folder", "Pick the folder in Finder."), gCache);
     place(*label(kPCacheInfo, "Cache Size", ""), gCache);
     // cvt1.14: the size limit, per user (was a fixed 50 GB unless set in the config file).
     auto* climit = labelled(desc.defineDoubleParam(kPCacheLimit), "Cache Limit (GB)",
@@ -2790,17 +2885,25 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
                          "Where the models and the LTX runtime are installed (about 80 GB, or about "
                          "125 GB on M1 and M2 Macs, where Setup adds a faster copy of the main "
                          "model).");
-    dir->setStringType(OFX::eStringTypeDirectoryPath);
-    dir->setDefault(homeDir() + "/ltx-alphagen-models");
+    dir->setStringType(OFX::eStringTypeSingleLine);
+    dir->setDefault(homeDir() + "/LTX-2.5");  // cvt1.46: one folder for every LTX-2.5 plugin
     perUser(dir);
     place(*dir, gModels);
+    place(*button(kPChooseModel, "Choose Model Folder", "Pick the folder in Finder."), gModels);
     auto* ex = labelled(desc.defineStringParam(kPExistingDir), "Existing Models",
                         "Optional: a folder that may already contain the model files (e.g. a ComfyUI "
                         "models folder). Matching files are verified and copied instead of downloaded.");
-    ex->setStringType(OFX::eStringTypeDirectoryPath);
+    ex->setStringType(OFX::eStringTypeSingleLine);
     ex->setDefault("");
     perUser(ex);
     place(*ex, gModels);
+    place(*button(kPChooseExisting, "Choose Existing Models", "Pick the folder in Finder."), gModels);
+    auto* linkExisting = labelled(desc.defineBooleanParam(kPLinkExisting), "Link Existing Models",
+                                  "Link to the files in Existing Models instead of copying them: saves up to 73 GB, but that "
+                                  "folder must stay where it is and stay available. Off: they are copied into the Model Folder.");
+    linkExisting->setDefault(false);
+    perUser(linkExisting);
+    place(*linkExisting, gModels);
     place(*label(kPSetupStatus, "Setup", ""), gModels);
 
     // --- Support (2 rows, per user) ---

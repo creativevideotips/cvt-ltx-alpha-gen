@@ -108,6 +108,10 @@ class Fp16CopyTest(unittest.TestCase):
         self.models = os.path.join(self.tmp.name, "models")
         self.src = os.path.join(self.models, "diffusion_models", "t-bf16.safetensors")
         self.dst = self.src.replace("-bf16", "-fp16")
+        # Never the real settings of whoever runs the tests.
+        self.choices = setup_helper.FP16_CHOICE_FILES
+        setup_helper.FP16_CHOICE_FILES = ()
+        self.addCleanup(setattr, setup_helper, "FP16_CHOICE_FILES", self.choices)
         os.makedirs(os.path.dirname(self.src))
         with open(self.src, "wb") as f:
             f.write(DATA)
@@ -131,6 +135,17 @@ class Fp16CopyTest(unittest.TestCase):
         with self.mock.patch.object(setup_helper.subprocess, "run", return_value=done), \
                 self.mock.patch.object(setup_helper, "run", side_effect=self.fake_run):
             return setup_helper.make_fp16_copy("py", self.man, self.models, self.prog)
+
+    def test_an_earlier_choice_holds(self):
+        choice = os.path.join(os.path.dirname(self.src), "other.conf")
+        setup_helper.FP16_CHOICE_FILES = (os.path.join(os.path.dirname(self.src), "missing.conf"), choice)
+        with open(choice, "w") as f:
+            f.write("model_dir=x\ntransformer_fp16=0\n")
+        self.assertEqual(self.go("fp16_probe 80.0 50.0\n"), "0")  # faster, but already decided
+        self.assertFalse(os.path.exists(self.dst))
+
+    def test_a_borderline_result_makes_no_copy(self):
+        self.assertEqual(self.go("fp16_probe 2.9 2.4\n"), "0")  # 1.21x, as an M5 Max can measure
 
     def test_faster_makes_copy_once(self):
         self.assertEqual(self.go("fp16_probe 80.0 50.0\n"), "1")

@@ -440,7 +440,26 @@ def gather_models(man: dict, model_dir: str, existing: str, token: str, prog: Pr
     return summary
 
 
-FP16_MIN_SPEEDUP = 1.2  # below this the extra 42 GB is not worth it (M2-M4 have native bf16)
+# Below this the extra 42 GB is not worth it. An M1 measures about 1.4; an M5 Max measured from 1.16 to just over
+# 1.2 on the same Mac, so a cutoff at 1.2 could make the copy one run and not the next.
+FP16_MIN_SPEEDUP = 1.3
+# The other LTX-2.5 plugin shares the Model Folder, so a choice either one made holds for both.
+FP16_CHOICE_FILES = (CONFIG, os.path.expanduser("~/.config/ltx-inpaint-still/config.conf"))
+
+
+def earlier_fp16_choice() -> str:
+    """"1" or "0" from an earlier Setup, "" if there was none: the choice isn't made again each run."""
+    for path in FP16_CHOICE_FILES:
+        try:
+            with open(path) as f:
+                for line in f:
+                    if line.startswith("transformer_fp16="):
+                        value = line.split("=", 1)[1].strip()
+                        if value in ("0", "1"):
+                            return value
+        except OSError:
+            pass
+    return ""
 
 
 def make_fp16_copy(py: str, man: dict, model_dir: str, prog: Progress) -> str:
@@ -450,6 +469,10 @@ def make_fp16_copy(py: str, man: dict, model_dir: str, prog: Progress) -> str:
     entry = next(e for e in man["files"] if e["key"] == "transformer")
     src = os.path.join(model_dir, entry["path"])
     dst = src.replace("-bf16.safetensors", "-fp16.safetensors")
+    earlier = earlier_fp16_choice()
+    if earlier == "0" or (earlier == "1" and os.path.exists(dst)):
+        log.info(f"fp16: keeping the earlier choice ({'copy' if earlier == '1' else 'no copy'})")
+        return earlier
     try:
         prog.update(0.90, "fp16: checking whether it is faster on this Mac")
         out = subprocess.run([py, "-I", "-B", worker, "--fp16-probe"], capture_output=True, text=True,
@@ -513,7 +536,7 @@ def main() -> int:
         man = json.load(f)
     model_dir = os.path.abspath(os.path.expanduser(a.model_dir))
     log.info(f"setup start: model_dir={model_dir} existing={a.existing or '-'} link={a.link} cache_root={a.cache_root} "
-             f"token={'given' if token else 'none'} (length {len(token)})")
+             f"token={'given' if token else 'none'}")
     prog = Progress(ui)
     t0 = time.time()
     try:

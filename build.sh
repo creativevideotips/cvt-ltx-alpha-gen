@@ -26,7 +26,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD="$HERE/build"
 DEVBUILD="$HERE/build-dev"
 TESTPY="$HOME/.cvt/ltx-alphagen-testpy"
-PORT_VERSION="cvt1.45"   # the version: Version label, and (as 1.12) the plugin version hosts store
+PORT_VERSION="cvt1.49"   # the version: Version label, and (as 1.12) the plugin version hosts store
 DEV=OFF
 SYSTEST=0
 for a in "$@"; do

@@ -11,9 +11,9 @@ port, not made or endorsed by Lightricks or Blackmagic Design.
 
 ## Download
 
-### [Download the installer: LTXAlphaGen-1.45.pkg](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.45/LTXAlphaGen-1.45.pkg)
+### [Download the installer: LTXAlphaGen-1.49.pkg](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.49/LTXAlphaGen-1.49.pkg)
 
-### [Download the guide (PDF)](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.45/LTX_Alpha_Gen_Guide.pdf)
+### [Download the guide (PDF)](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/download/v1.49/LTX_Alpha_Gen_Guide.pdf)
 
 These links download the files straight away. You won't find the installer in the list of code files above: GitHub keeps it on the [Releases page](https://github.com/creativevideotips/cvt-ltx-alpha-gen/releases/latest), under **Assets**. The installer is only the plugin, and you also need to [download the models](#setup-download-the-models).
 
@@ -31,10 +31,10 @@ These links download the files straight away. You won't find the installer in th
 - **Tested with Resolve Studio and Fusion Studio.** It has not yet been tested in the
   free version of Resolve. Magic Mask is Studio-only, but any roto or garbage matte
   works for [Guided ROI](#choosing-the-subject-guided-roi).
-- **128 GB of RAM recommended.** 64 GB can work for small pictures (a Guided ROI
-  crop or a low resolution) and short clips, in Fusion Studio with nothing else
-  open, but expect it to be slow on older chips. The model alone holds about
-  41 GB of the GPU's memory, however small the clip.
+- **128 GB of RAM recommended; not recommended on 64 GB or less.** The model alone
+  holds about 41 GB of the GPU's memory, however small the clip, and on a 64 GB Mac
+  macOS leaves little more than that. One M1 Max with 64 GB ran it in Fusion Studio
+  with nothing else open; an M2 Max with 64 GB could not load the model.
 - **It takes time.** Expect several minutes for a short HD clip on a fast Mac
   ([measured speeds](#size-and-speed)). The GPU stays busy, so playback is slow
   while a job runs.
@@ -81,10 +81,11 @@ The rest happens in the node's **Setup** section.
    **Create new token**, type **Read**. The name is only a label for you. Copy the
    token (it starts with `hf_`).
 4. Paste it into **Hugging Face Token** and press Return.
-5. Check the **Model Folder** (by default `~/ltx-alphagen-models`). If you already
+5. Check the **Model Folder** (by default `~/LTX-2.5`). If you already
    have some of the model files, for example in a ComfyUI folder, set **Existing
    Models** to that folder: matching files are checked and copied instead of
-   downloaded.
+   downloaded. Tick **Link Existing Models** to link to them instead of
+   copying them, which saves up to 73 GB, as long as that folder stays available.
 6. Press **Download**. A window shows the progress. It installs its own Python
    and everything the model needs into the Model Folder, separate from anything
    else on your Mac, then downloads the models and checks every file. Keep every file in the folder,
@@ -281,10 +282,8 @@ or use Guided ROI. UHD only fits for very short clips, about 17 frames.
 | M5 Max, 128 GB | 63 HD frames with Frame Hold Off, 2x, 4x | about 9, 17, 35 min |
 | M1 Max, 64 GB | 33 HD frames in Fusion Studio | about 32 min |
 
-On a 64 GB Mac, use Fusion Studio. It leaves about 45-49 GB for the model, against about
-39 GB in Resolve, where the memory check stops HD jobs (Skip Memory Check runs them
-anyway). Keep Fusion Studio's own memory setting (Preferences > Memory) at the default
-80% or lower.
+64 GB Macs are not recommended. If you try one anyway, use Fusion Studio with nothing
+else open: it leaves about 45-49 GB for the model, against about 39 GB in Resolve.
 
 ## Known limits
 
@@ -305,7 +304,7 @@ Delete these. The last three hold the models, mattes and settings, and only exis
 you have used the plugin.
 
 - `/Library/OFX/Plugins/LTXAlphaGen.ofx.bundle`
-- `~/ltx-alphagen-models` (or your Model Folder)
+- `~/LTX-2.5` (or your Model Folder)
 - `~/.cache/ltx-alphagen` (and your Cache Folder, if you changed it)
 - `~/.config/ltx-alphagen`
 

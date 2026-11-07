@@ -312,3 +312,14 @@ about Flame, Linux or NVIDIA, that part does not apply here.
 - cvt1.45: the installer refuses to install on a Mac older than macOS 15 (the plugin is built for macOS 15,
   and macOS won't load it on an older system, so before this it installed and then simply didn't appear),
   and the README, guide and installer Read Me now say macOS 15 or later. No change to the plugin itself.
+
+- cvt1.46: the Model Folder now starts at `~/LTX-2.5`, one folder for every LTX-2.5 plugin, and
+  a new user who set up LTX Inpaint Still first keeps that folder. Anyone already set up keeps theirs. Setup's speed test
+  for the extra 42 GB copy now needs 1.3x, not 1.2x, and doesn't decide again once it has decided, because an M5 Max sits right
+  at 1.2x and could get the copy on one run and not the next.
+- cvt1.47: new Link Existing Models checkbox. Fusion never showed the question that used to ask, so Download always copied.
+  The token's length is no longer logged.
+- cvt1.48: the folder fields have Choose buttons that open the Mac's Finder folder picker, in place of Fusion's browse
+  control, which only picks files.
+- cvt1.49: a Model Folder that was set up and has since been deleted is no longer offered from the saved settings: the field goes
+  back to `~/LTX-2.5`. A folder on a drive that isn't mounted stays, since the drive may come back.
