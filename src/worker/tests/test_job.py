@@ -17,6 +17,9 @@ sys.path.insert(0, WORKER_DIR)
 
 from ltxag_worker import cache, transport  # noqa: E402
 
+# Windows port: the variable that names the user's folder (where ~ points, so the config, cache
+# and log of a test stay out of the real ones).
+HOME_VAR = "USERPROFILE" if sys.platform == "win32" else "HOME"
 # The plugin's staging folder (decision 64): /dev/shm on Linux, a temp folder elsewhere.
 STAGING = "/dev/shm" if sys.platform == "linux" else tempfile.gettempdir()
 
@@ -50,7 +53,7 @@ class JobTest(unittest.TestCase):
         mpath = f"{STAGING}/ltxag_job_{job_id}.json"
         with open(mpath, "w") as f:
             json.dump(manifest, f)
-        env = dict(os.environ, HOME=root)  # keep test logs out of the user's real log
+        env = dict(os.environ, **{HOME_VAR: root})  # keep test logs out of the user's real log
         rc = subprocess.run([sys.executable, "-I", "-B", os.path.join(WORKER_DIR, "job.py"), mpath,
                              "--no-ui"], timeout=60, env=env).returncode
         self.assertTrue(os.path.exists(os.path.join(root, ".cache/ltx-alphagen/logs/ltx-alphagen.log")))
@@ -128,7 +131,8 @@ class JobTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             rc, _, status = self.run_job(root, frames, [[0, 3]], [[[0, 1.0]]] * 3, "crash")
             self.assertEqual((rc, status["state"]), (1, "failed"))
-            self.assertIn("signal 11", status["message"])
+            # Windows has no signals: there the dummy ends with the exit code a segfault would show.
+            self.assertIn("exit code 11" if sys.platform == "win32" else "signal 11", status["message"])
 
 
 class TrackerTest(unittest.TestCase):
@@ -232,7 +236,7 @@ class VramRecordTest(unittest.TestCase):
     def test_csv_row(self):
         import job
 
-        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME": home}):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {HOME_VAR: home}):
             m = {"job_id": "j1", "precision": "fp8", "width": 1920, "height": 1080, "chunks": [[0, 145]],
                  "unload": False, "vram": {"estimate_gb": 43.8, "free_gb": 89.7, "resident_gb": 0.0,
                                            "reserve_gb": 2.7, "model_w": 1920, "model_h": 1088,
@@ -260,7 +264,8 @@ class WorkerExitedWhileWaitingTest(unittest.TestCase):
         ok_a, ok_b = socket.socketpair()
         ok_b.sendall(b"info accepted\n")  # stays connected, like a worker taking the job
         conns = iter([gone_a, ok_a])
-        with mock.patch.object(job.ResidentChannel, "_ensure_server"), \
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {HOME_VAR: home}), \
+                mock.patch.object(job.ResidentChannel, "_ensure_server"), \
                 mock.patch.object(job.ResidentChannel, "_wait_exit") as waited, \
                 mock.patch.object(job.ResidentChannel, "_connect", side_effect=lambda: next(conns)):
             ch = job.ResidentChannel({"worker_socket": "/tmp/none"}, {"job_id": "x"}, None, None)

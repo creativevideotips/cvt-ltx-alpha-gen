@@ -3,16 +3,17 @@
 Three modes:
   one-shot (job.py legacy / smoke tests):
       --in F --chunks s:l,... --out-prefix P --model-dir M --embeddings E
-      [--precision bf16|fp16] [--colour Auto|<colour.SOURCES key>] [--colour-tag T] [--ocio-config C]
-      [--hold K | --holds K,K,..]
+      [--precision bf16|fp8|fp16] [--offload none|cpu|disk] [--colour Auto|<colour.SOURCES key>]
+      [--colour-tag T] [--ocio-config C] [--hold K | --holds K,K,..]
       stdout lines as in dummy_worker.py: info / progress / chunk_done / done / error
   serve (resident worker, decisions 11/19/33):
-      --serve SOCKET --model-dir M --embeddings E --precision P [--flame-pid N]
+      --serve SOCKET --model-dir M --embeddings E --precision P [--offload O] [--flame-pid N]
       [--idle-timeout S]
-      Loads the model once, then serves jobs over a Unix socket. Each connection sends one
+      Loads the model once, then serves jobs over a Unix socket (Windows: a loopback port,
+      oslayer.listen). Each connection sends one
       JSON request line {"in", "chunks", "out_prefix", "colour", "colour_tag", "ocio_config", "precision",
-      "model_dir", "unload", "seed", "holds"} and receives the same stdout-style lines back. A request
-      whose precision/model_dir differ gets "restart" and the server exits, so the client
+      "model_dir", "unload", "offload", "seed", "holds"} and receives the same stdout-style lines back. A request
+      whose precision/model_dir/offload differ gets "restart" and the server exits, so the client
       starts a matching one. The server exits after a job with "unload": true, after
       --idle-timeout seconds without jobs (default 300; $LTXAG_IDLE_TIMEOUT overrides), or
       when --flame-pid dies. SOCKET.json holds {pid, precision, model_dir, state, vram_gb}.
@@ -51,8 +52,12 @@ preparing, denoising, decoding), "step <chunk> <k> <n>" after each denoising ste
 end "vram <min_free_gb> <peak_alloc_gb> <peak_reserved_gb> <reserved_at_start_gb> <torch>": the lowest
 free device memory sampled during the job (every 0.25 s), for comparing the plugin's estimate
 with what the job really took.
-Device (decision 65): MPS (Apple Silicon) through Accel; the CVT port is Mac only (cvt1.17:
-the CUDA paths are gone). "free"
+Device (decision 65): MPS (Apple Silicon) or, since the Windows port, CUDA (an NVIDIA card on
+Windows; the CUDA code is upstream's Linux code, taken out in cvt1.17 and put back), through Accel.
+Windows port: precision fp8 (the transformer's weights cast to 8 bits, QuantizationKind "fp8-cast",
+as upstream) and --offload cpu|disk (LTX-2's OffloadMode, utils/types.py: the weights stay in system
+memory, or on disk, and go to the GPU a layer at a time, so a 24 GB card can run the 22B model).
+On MPS "free"
 is Metal's recommended working set minus what this process holds (as upstream's
 ltx_core/devices.py:mps_activation_budget_bytes), and the peaks are sampled: torch.mps has no
 peak statistics.
@@ -74,10 +79,15 @@ import threading
 import time
 import traceback
 
+# Windows port (as upstream on Linux): the allocator setting of the measured CLI runs; it must be
+# set before torch initialises CUDA. Linux only: torch has no expandable segments on Windows.
+if sys.platform == "linux":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np  # noqa: E402
 
-from ltxag_worker import colour, fp16, padding, transport  # noqa: E402
+from ltxag_worker import colour, fp16, oslayer, padding, transport  # noqa: E402
 from ltxag_worker.log import Logger  # noqa: E402
 
 MEMORY_REF = "mem://ltxag-reference"
@@ -90,43 +100,59 @@ log = Logger("worker")
 
 
 class Accel:
-    """The Apple GPU this worker runs on (MPS, decision 65). Memory in GB. CVT port (cvt1.17):
-    Mac only, the CUDA branches are gone; `kind` stays "mps" for the callers that read it."""
+    """The GPU this worker runs on: MPS (Apple Silicon, decision 65) or CUDA (Windows port: an
+    NVIDIA card; upstream's Linux code). Memory in GB."""
 
     def __init__(self, torch) -> None:  # noqa: ANN001 - the torch module
         self.torch = torch
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("no Apple GPU (MPS) is available to the worker")
-        self.kind = "mps"
+        if torch.cuda.is_available():
+            self.kind = "cuda"
+        elif torch.backends.mps.is_available():
+            self.kind = "mps"
+        else:
+            raise RuntimeError("no NVIDIA (CUDA) or Apple (MPS) GPU is available to the worker")
         self.device = torch.device(self.kind)
-        self.peak = [0.0, 0.0]  # sampled allocated, reserved (torch.mps has no peak statistics)
+        self.peak = [0.0, 0.0]  # MPS only: sampled allocated, reserved (torch.mps has no peak statistics)
 
     def describe(self) -> str:
         t = self.torch
+        if self.kind == "cuda":
+            return f"torch {t.__version__} cuda {t.version.cuda} gpu {t.cuda.get_device_name(0)}"
         return f"torch {t.__version__} mps, recommended working set {t.mps.recommended_max_memory() / 2**30:.1f} GB"
 
     def empty_cache(self) -> None:
-        self.torch.mps.empty_cache()
+        (self.torch.cuda if self.kind == "cuda" else self.torch.mps).empty_cache()
 
     def reserved_gb(self) -> float:
-        return self.torch.mps.driver_allocated_memory() / 2**30
+        t = self.torch
+        return (t.cuda.memory_reserved() if self.kind == "cuda" else t.mps.driver_allocated_memory()) / 2**30
 
     def allocated_gb(self) -> float:
-        return self.torch.mps.current_allocated_memory() / 2**30
+        t = self.torch
+        return (t.cuda.memory_allocated() if self.kind == "cuda" else t.mps.current_allocated_memory()) / 2**30
 
     def free_gb(self) -> float:
         t = self.torch
+        if self.kind == "cuda":
+            return t.cuda.mem_get_info()[0] / 2**30
         return (t.mps.recommended_max_memory() - t.mps.driver_allocated_memory()) / 2**30
 
     def sample(self) -> float:
-        """Free memory now; also updates the sampled peaks."""
-        self.peak = [max(self.peak[0], self.allocated_gb()), max(self.peak[1], self.reserved_gb())]
+        """Free memory now; on MPS also updates the sampled peaks."""
+        if self.kind == "mps":
+            self.peak = [max(self.peak[0], self.allocated_gb()), max(self.peak[1], self.reserved_gb())]
         return self.free_gb()
 
     def reset_peaks(self) -> None:
-        self.peak = [self.allocated_gb(), self.reserved_gb()]
+        if self.kind == "cuda":
+            self.torch.cuda.reset_peak_memory_stats()
+        else:
+            self.peak = [self.allocated_gb(), self.reserved_gb()]
 
     def peaks_gb(self) -> tuple[float, float]:
+        t = self.torch
+        if self.kind == "cuda":
+            return t.cuda.max_memory_allocated() / 2**30, t.cuda.max_memory_reserved() / 2**30
         self.sample()
         return self.peak[0], self.peak[1]
 
@@ -289,16 +315,18 @@ class Engine:
     """The loaded pipeline. One per process; serves any number of jobs."""
 
     def __init__(self, model_dir: str, embeddings: str, precision: str, emit, keep_transformer: bool = True,
-                 frames_on_gpu: bool = False):
+                 frames_on_gpu: bool = False, offload: str = "none"):
         import torch
 
         import ltx_pipelines.ic_lora as ic_lora
         from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
         from ltx_pipelines.utils.model_paths import ModelPaths
+        from ltx_pipelines.utils.quantization_factory import QuantizationKind
+        from ltx_pipelines.utils.types import OffloadMode
 
         self.torch = torch
         self.accel = Accel(torch)
-        self.model_dir, self.precision = model_dir, precision
+        self.model_dir, self.precision, self.offload = model_dir, precision, offload
         self.frames_on_gpu = frames_on_gpu  # A/B only: the pre-2026-10-11 behaviour
         self.fp16 = precision == "fp16"  # decision 68
         t0 = time.time()
@@ -319,14 +347,18 @@ class Engine:
                                         "press Download on the Setup tab to make it again")
             emit("info", f"fp16 transformer from {transformer_file}")
         ic_lora.SequentialVideoFrameSource = MemoryFrameSource  # injection 1
-        quant = None  # cvt1.17: no fp8 on a Mac (MPS has no fp8 type; the plugin never asks for it)
+        # fp8 (CUDA only; MPS has no fp8 type and the plugin never asks for it there): as upstream.
+        quant = QuantizationKind("fp8-cast").to_policy(paths["transformer"]) if precision == "fp8" else None
+        if offload != "none":  # Windows port
+            emit("info", f"model weights kept {'in system memory' if offload == 'cpu' else 'on disk'} and sent "
+                         "to the GPU a layer at a time (offload)")
         self.pipeline = ic_lora.ICLoraPipeline(
             model_paths=ModelPaths.from_split(
                 transformer_path=transformer_file, text_encoder_path=paths["text_encoder"],
                 video_vae_path=paths["video_vae"], audio_vae_path=paths["audio_vae"]),
             spatial_upsampler_path=paths["upsampler"],
             loras=[LoraPathStrengthAndSDOps(paths["lora"], 1.0, LTXV_LORA_COMFY_RENAMING_MAP)],
-            quantization=quant)
+            quantization=quant, offload_mode=OffloadMode(offload))
         if self.fp16:
             self.pipeline.dtype = torch.float16  # latents, noise and reference frames (ic_lora.py:312)
             self.pipeline._diffusion_stage._dtype = torch.float16  # the denoising state (blocks.py:565)
@@ -341,7 +373,8 @@ class Engine:
                                                                       sync=torch.mps.synchronize)
         self._on_step = lambda k, n: None
         self._install_step_hook()  # injection 5
-        self._fix_decode_budget(emit)  # injection 7 (cvt1.32)
+        if self.accel.kind == "mps":  # (the budget is a share of Metal's working set)
+            self._fix_decode_budget(emit)  # injection 7 (cvt1.32)
         if HASH_STAGES:  # cvt1.32: the latent going into the decoder
             class HashingDecoder:
                 def __init__(self, inner) -> None:  # noqa: ANN001
@@ -382,7 +415,7 @@ class Engine:
 
             blocks.DiffusionStage._transformer_ctx = resident_ctx
         self.accel.empty_cache()
-        emit("info", f"engine ready in {time.time() - t0:.1f} s (precision {precision}, "
+        emit("info", f"engine ready in {time.time() - t0:.1f} s (precision {precision}, offload {offload}, "
                      f"transformer {'resident' if keep_transformer else 'rebuilt per chunk'})")
 
     def _fix_decode_budget(self, emit) -> None:
@@ -439,7 +472,8 @@ class Engine:
                 emit("info", "prompt embedding cache was built for other model files; rebuilding")
         if not current:
             emit("progress", 0.0, "building prompt cache (one-time, loads Gemma)")
-            rc = subprocess.run([sys.executable, "-I", "-B", os.path.abspath(__file__), "--build-embeddings", path,
+            rc = subprocess.run([sys.executable, "-I", "-B", *(["-X", "utf8"] if oslayer.WINDOWS else []),
+                                 os.path.abspath(__file__), "--build-embeddings", path,
                                  "--transformer", paths["transformer"], "--text-encoder", paths["text_encoder"],
                                  "--video-vae", paths["video_vae"]], stdin=subprocess.DEVNULL).returncode
             if rc != 0 or not os.path.exists(path):
@@ -547,7 +581,7 @@ def args_safe(path: str) -> str:
 def classify(exc: BaseException) -> tuple[str, str]:
     import torch
 
-    if isinstance(exc, torch.OutOfMemoryError):  # torch's out-of-memory error (MPS too)
+    if isinstance(exc, torch.OutOfMemoryError):  # torch's out-of-memory error (CUDA and MPS)
         return "oom", f"out of GPU memory: {str(exc).splitlines()[0]}"
     if isinstance(exc, FileNotFoundError):
         return "input", str(exc)
@@ -570,7 +604,7 @@ def one_shot(a) -> int:  # noqa: ANN001
     try:
         conv = colour.Converter(a.colour, a.ocio_config, a.colour_tag)
         engine = Engine(a.model_dir, a.embeddings, a.precision, emit, keep_transformer=not a.rebuild_transformer,
-                        frames_on_gpu=a.frames_on_gpu)
+                        frames_on_gpu=a.frames_on_gpu, offload=a.offload)
         engine.run(a.inp, [tuple(int(v) for v in c.split(":")) for c in a.chunks.split(",")],
                    a.out_prefix, conv, emit, a.seed,
                    [int(k) for k in a.holds.split(",")] if a.holds else [a.hold] * len(a.chunks.split(",")))
@@ -591,50 +625,38 @@ class Server:
         self.sock_path, self.info_path = a.serve, a.serve + ".json"
         self.idle = float(os.environ.get("LTXAG_IDLE_TIMEOUT", a.idle_timeout))
         self.engine = None
+        self.endpoint: dict = {}  # Windows: the port and the secret a client needs (oslayer.listen)
 
     def write_info(self, state: str, message: str = "") -> None:
         info = {"pid": os.getpid(), "precision": self.a.precision, "model_dir": self.a.model_dir,
                 "state": state, "message": message, "time": time.time(),
-                "vram_gb": round(self.engine.vram_gb(), 2) if self.engine else 0.0}
+                "vram_gb": round(self.engine.vram_gb(), 2) if self.engine else 0.0,
+                "offload": self.a.offload, **self.endpoint}
         tmp = f"{self.info_path}.tmp{os.getpid()}"
         with open(tmp, "w") as f:
             json.dump(info, f)
-        os.replace(tmp, self.info_path)
+        oslayer.replace(tmp, self.info_path)
 
     def flame_alive(self) -> bool:
         pid = self.a.flame_pid
-        if not pid:
-            return True
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
+        return not pid or oslayer.pid_alive(pid)
 
     def serve(self) -> int:
         os.makedirs(os.path.dirname(self.sock_path), exist_ok=True)
-        log.info(f"server starting: precision={self.a.precision} model_dir={self.a.model_dir} "
+        log.info(f"server starting: precision={self.a.precision} offload={self.a.offload} model_dir={self.a.model_dir} "
                  f"idle_timeout={self.idle:.0f}s flame_pid={self.a.flame_pid}")
         self.write_info("loading")
         try:
             self.engine = Engine(self.a.model_dir, self.a.embeddings, self.a.precision,
                                  lambda *p: log.info(" ".join(str(x) for x in p)),
                                  keep_transformer=not self.a.rebuild_transformer,
-                                 frames_on_gpu=self.a.frames_on_gpu)
+                                 frames_on_gpu=self.a.frames_on_gpu, offload=self.a.offload)
         except Exception as exc:  # noqa: BLE001
             kind, msg = classify(exc)
             log.error(f"server failed to load: {kind} {msg}\n{traceback.format_exc()}")
             self.write_info("failed", f"{kind} {msg}")
             return 2
-        try:
-            os.unlink(self.sock_path)
-        except FileNotFoundError:
-            pass
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(self.sock_path)
-        os.chmod(self.sock_path, 0o600)
+        srv, self.endpoint = oslayer.listen(self.sock_path)
         srv.listen(8)
         srv.settimeout(1.0)
         self.write_info("ready")
@@ -662,10 +684,7 @@ class Server:
         finally:
             srv.close()
             for p in (self.sock_path, self.info_path):
-                try:
-                    os.unlink(p)
-                except FileNotFoundError:
-                    pass
+                oslayer.remove(p)
             log.info(f"server exiting: {reason}")
         return 0
 
@@ -681,14 +700,21 @@ class Server:
 
         try:
             req = json.loads(f.readline().decode() or "{}")
-        except json.JSONDecodeError as exc:
-            emit("error", "input", f"bad request: {exc}")
+        except (json.JSONDecodeError, OSError) as exc:
+            with contextlib.suppress(Cancelled):
+                emit("error", "input", f"bad request: {exc}")
+            return "ok"
+        if self.endpoint.get("secret") and req.get("secret") != self.endpoint["secret"]:
+            # Windows: something other than our job.py found the port. No answer, nothing done.
+            log.warn("a connection without the worker's secret was dropped")
             return "ok"
         if req.get("ping"):
             emit("pong", self.a.precision, self.a.model_dir)
             return "ok"
-        if req.get("precision") != self.a.precision or req.get("model_dir") != self.a.model_dir:
-            log.info(f"request needs precision={req.get('precision')} model_dir={req.get('model_dir')}; restarting")
+        if (req.get("precision") != self.a.precision or req.get("model_dir") != self.a.model_dir
+                or req.get("offload", "none") != self.a.offload):
+            log.info(f"request needs precision={req.get('precision')} offload={req.get('offload', 'none')} "
+                     f"model_dir={req.get('model_dir')}; restarting")
             emit("restart")
             return "restart"
         self.write_info("busy")
@@ -751,7 +777,9 @@ def main() -> int:
     ap.add_argument("--out-prefix", default=None)
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--embeddings", required=True)
-    ap.add_argument("--precision", default="bf16", choices=["bf16", "fp16"])
+    ap.add_argument("--precision", default="bf16", choices=["bf16", "fp8", "fp16"])
+    ap.add_argument("--offload", default="none", choices=["none", "cpu", "disk"],
+                    help="where the transformer's weights are kept (LTX-2 OffloadMode)")
     ap.add_argument("--colour", default="Bypass", choices=[colour.AUTO] + list(colour.SOURCES))
     ap.add_argument("--colour-tag", default="", help="with --colour Auto: the colourspace the frames are in")
     ap.add_argument("--ocio-config", default="")

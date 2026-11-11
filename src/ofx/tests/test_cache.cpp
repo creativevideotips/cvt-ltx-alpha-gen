@@ -1,8 +1,10 @@
 // Tests for the disk matte cache and its purge/sweep rules (decision 36).
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +17,8 @@
 #include "cache.h"
 #include "half.h"
 #include "platform.h"
+#include "process.h"
+#include "test_os.h"
 #include "transport.h"
 
 using namespace ltxag;
@@ -48,15 +52,24 @@ static void writeMatte(const std::string& root, const std::string& key, uint32_t
 }
 
 static int deadPid() {
+#ifdef _WIN32
+  // Windows port: no fork; a process that has ended and been waited for.
+  WorkerProcess p;
+  std::string err;
+  if (!p.start({"cmd.exe", "/c", "exit"}, cleanEnvironment(), err)) return 0x7ffffff0;
+  const int pid = p.pid();
+  p.wait();
+  return pid;
+#else
   const pid_t pid = fork();
   if (pid == 0) _exit(0);
   waitpid(pid, nullptr, 0);
   return pid;  // reaped, so no longer alive
+#endif
 }
 
 int main() {
-  char tmpl[] = "/tmp/ltxag_cache_test_XXXXXX";
-  const std::string root = mkdtemp(tmpl);
+  const std::string root = testTempDir("ltxag_cache_test");
 
   // Keys: stable, 16 hex chars, sensitive to both source hash and params.
   const std::string k1 = matteKey(42, "v1|cs=Bypass");
@@ -172,7 +185,10 @@ int main() {
       const std::string d = root + "/fhm";
       CHECK(!frameHasMatte(d, "node1", 1001, "sig"), "no matte yet");
       const std::string p = mattePath(d, frameKey("node1", 1001, "sig", 2));
-      CHECK(std::system(("mkdir -p '" + p.substr(0, p.rfind('/')) + "' && touch '" + p + "'").c_str()) == 0, "touch");
+      mkdir(d.c_str(), 0755);
+      mkdir(p.substr(0, p.rfind('/')).c_str(), 0755);
+      std::ofstream(p) << "";
+      CHECK(exists(p), "touch");
       CHECK(frameHasMatte(d, "node1", 1001, "sig"), "matte in slot 2 not found");
       CHECK(!frameHasMatte(d, "node1", 1002, "sig"), "another frame");
       CHECK(!frameHasMatte(d, "node1", 1001, "other"), "other settings");
@@ -230,12 +246,16 @@ int main() {
     CHECK(writeThumb(root, a0, t1), "writeThumb");
     std::vector<float> back;
     CHECK(readThumb(root, a0, back) && back == t1, "readThumb round trip");
+    const std::string fresh = root + "/not/there/yet";  // every level of a missing cache folder is made
+    CHECK(writeThumb(fresh, a0, t1) && readThumb(fresh, a0, back) && back == t1, "thumbnail in a new cache folder");
+    markPending(fresh, {"eeeeeeeeeeeeeeee"}, getpid());
+    CHECK(isPending(fresh, "eeeeeeeeeeeeeeee"), "pending marker in a new cache folder");
     writeMatte(root, a0, 4, 3, 0x3c00, 0);
     CHECK(purgeKeys(root, {a0}) == 1, "purgeKeys");
     CHECK(!exists(thumbPath(root, a0)) && !exists(mattePath(root, a0)), "purge left a thumbnail");
   }
 
-  if (std::system(("rm -rf " + root).c_str()) != 0) std::fprintf(stderr, "cleanup failed\n");
+  testRemoveTree(root);
   if (failures) {
     std::fprintf(stderr, "%d failure(s)\n", failures);
     return 1;

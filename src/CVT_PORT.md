@@ -7,7 +7,7 @@ Code changes are marked `CVT Resolve port` in comments. The upstream design
 notes (moved to `upstream-notes/`) are kept as reference; where they talk
 about Flame, Linux or NVIDIA, that part does not apply here.
 
-## Mac only
+## Mac only (until cvt1.50, which adds Windows: see "Windows" below)
 
 - Apple Silicon only. Removed: the Linux platform layer
   (`platform_linux*.cpp`, NVML), `tools/nvml_probe.cpp`, the Linux symbol
@@ -34,6 +34,62 @@ about Flame, Linux or NVIDIA, that part does not apply here.
 - System test: the node helper sets Output = Overlay for the upstream image
   checks; `process_chunks_merge_purge` also checks Source + Matte Alpha and
   Matte.
+
+## Windows (cvt1.50)
+
+Windows 10/11 x64 with an NVIDIA card (CUDA), beside the Mac build. The Mac code paths are
+unchanged; what Windows needs is added beside them. Code changes are marked `Windows port`.
+
+- **C++.** `ofx/src/win_compat.h/.cpp` supply the POSIX calls the shared sources use (`stat`,
+  `unlink`, `mkdir`, `opendir`, `open`/`write`/`pread`, `localtime_r` ...) for UTF-8 paths, so
+  those sources stay as they are (CMake sets `_CRT_DECLARE_NONSTDC_NAMES=0`, so the C runtime's
+  own ANSI-code-page versions of those names are not declared). `oscompat.h` has the three calls
+  that differ in form on both systems: `homeDirectory()` (HOME / %USERPROFILE%), `renameOver()`
+  (std::rename / MoveFileEx with REPLACE_EXISTING, retried while a reader has the target open)
+  and `fsPath()` (a wide path for file streams). `process_win.cpp` is `process.h` for Windows:
+  CreateProcess with only the named handles inherited, a job object for the worker (kill = end
+  the job), detached launches without a console window. `platform_win.cpp` is the platform
+  layer: the temp folder for staging, NVML (`nvml.dll`, loaded at run time; the calls and structs
+  of upstream's `platform_linux_nvml.cpp`) for GPU memory, Notepad for View Licence,
+  ShellExecute for the web pages. `process.h` passes on the C runtime's own `process.h`, which
+  `<thread>` includes and which this file's name hides on the include path.
+- **Windows.** `ofx/ui/ltxag_ui.cpp` builds `ltxag_ui.exe` (beside the .ofx in `Contents/Win64`):
+  the progress window with Cancel (zenity's stdin protocol, as `mac_progress.swift`), message
+  boxes and Explorer's folder picker. Built with the plugin, not on the user's PC.
+- **Python.** `oslayer.py` has the Windows forms of what job.py, the worker and Setup did with
+  POSIX calls: `pid_alive` (on Windows `os.kill(pid, 0)` sends Ctrl+C, it does not ask),
+  `kill_tree` (taskkill /T for killpg), `NEW_SESSION`, `lock_file` (msvcrt for flock), `replace`
+  and `remove` (retry while another process has the file open), and `listen` / `connect` for
+  the resident worker: Python has no Unix sockets on Windows, so there it is a loopback TCP port
+  chosen by the system plus a random secret, both in the worker's info file, which every request
+  must carry. Python is started with `-X utf8` on Windows (text files are UTF-8 on both systems).
+- **CUDA again.** The worker's `Accel` has upstream's CUDA branches back (cvt1.17 took them out),
+  and precision `fp8` (`QuantizationKind("fp8-cast")`). New: `--offload cpu|disk` and the
+  manifest's `offload`, LTX-2's `OffloadMode`: the transformer's weights stay in system memory
+  (or on disk) and go to the GPU a layer at a time. The plugin's Model Loading choice (Auto, On
+  the GPU, In System Memory, From Disk; `planMemory` in plugin.cpp) decides it at Process; Auto
+  takes the GPU when the estimate fits its free memory, else system memory when 26 GB (fp8) or
+  48 GB (bf16) of it is free, else disk. A worker with another offload is restarted, like another
+  precision. The Performance section shows on Windows (Precision, Model Loading). The estimate
+  for streamed weights (`vram_estimate.h`) is built from upstream's Linux fits and is UNVERIFIED.
+  The fixed decode budget (cvt1.32) and the fp16 copy stay Mac only.
+- **Setup.** Windows has no system Python: `build.ps1` puts the pinned `uv.exe` beside the .ofx
+  (checked against the manifest's new `uv.win32` SHA-256), and Download runs
+  `uv run --managed-python --python <pinned> python setup_helper.py`, which fetches the pinned
+  Python into `<Model Folder>/runtime`; the helper then uses that uv (`$LTXAG_UV`). No C compiler
+  check (no Triton on Windows; LTX-2 falls back to its eager kernels), the CUDA smoke test
+  again, the venv's `Scripts\python.exe`. `--link`: a symlink, else a hard link, else a copy.
+  The lockfile's hash of the Windows `torchaudio 2.11.1+cu132` wheel is updated: the file at
+  that URL was replaced after the lock was made (the same hash is now on PyTorch's release
+  index), so `uv sync --frozen` refused it. The Linux hashes changed too; they are left alone.
+- **Build and tests.** `build.ps1`, `install.ps1` (to `C:\Program Files\Common Files\OFX\Plugins`),
+  `systest/run_systest.ps1` with `systest/fake_ui.cpp` as the fake window (put in a copy of the
+  bundle), `test_os.h` for the unit tests, `worker/tests/test_resident.py` (the worker's server and
+  a client with the model faked, on both systems). `.github/workflows/build.yml` builds and runs
+  the unit tests and the fast system test on macOS and Windows runners.
+- **Tested** on Windows 11, RTX 4090, Resolve Studio 21.2: unit tests, fast system test, loading
+  and a dummy-worker Process in Resolve, Setup up to the model download (runtime installed, CUDA
+  check passed). **Not tested:** the model download and the real model on Windows.
 
 ## Changelog
 
@@ -323,3 +379,6 @@ about Flame, Linux or NVIDIA, that part does not apply here.
   control, which only picks files.
 - cvt1.49: a Model Folder that was set up and has since been deleted is no longer offered from the saved settings: the field goes
   back to `~/LTX-2.5`. A folder on a drive that isn't mounted stays, since the drive may come back.
+- cvt1.50: Windows (x64, NVIDIA): see "Windows" above. New Model Loading choice (hidden on a Mac). Also for the Mac: a Process
+  with no cache folder yet (deleted, or a new Cache Folder typed in) makes it, where it used to end in MATTE MISSING because
+  the thumbnails and pending markers could not be written.

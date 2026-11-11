@@ -1,0 +1,46 @@
+# Builds the plugin and runs the unit tests and the fast system test (dummy worker, no GPU, no
+# models) on both platforms, for every push and pull request. It publishes nothing.
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-15  # Apple Silicon
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, unit tests, fast system test
+        run: ./build.sh --systest
+      - name: Keep the system test's logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: systest-macos
+          path: build-dev/systest_work/out-fast
+          if-no-files-found: ignore
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Build, unit tests, fast system test
+        shell: pwsh
+        run: ./build.ps1 -Systest
+      - name: Keep the system test's logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: systest-windows
+          path: build-dev/systest_work/out-fast
+          if-no-files-found: ignore

@@ -24,8 +24,10 @@ These links download the files straight away. You won't find the installer in th
 
 - **Try Magic Mask first.** Resolve's Magic Mask is far faster, so use it first.
   When its matte isn't good enough, use LTX Alpha Gen for the more precise work.
-- **Mac with Apple Silicon only.** It runs the model on the Mac's GPU. There is
-  no Windows, Linux or NVIDIA version.
+- **Mac with Apple Silicon, or a Windows PC with an NVIDIA card.** The Mac version is
+  the released one, and what this page describes. The Windows version is new, has no
+  installer yet and has not run the real model yet: see [Windows](#windows-nvidia).
+  There is no Linux version.
 - **macOS 15 (Sequoia) or later.** The plugin is built for macOS 15, and the installer
   will not install on an older macOS.
 - **Tested with Resolve Studio and Fusion Studio.** It has not yet been tested in the
@@ -308,9 +310,58 @@ you have used the plugin.
 - `~/.cache/ltx-alphagen` (and your Cache Folder, if you changed it)
 - `~/.config/ltx-alphagen`
 
+## Windows (NVIDIA)
+
+New in 1.50 and experimental. It is the same plugin, built for Windows 10 and 11 (64-bit) and
+running the model with PyTorch on an NVIDIA card (CUDA). There is no installer yet: you
+[build it from source](#build-from-source).
+
+**What has been tested** (Windows 11, RTX 4090 24 GB, Resolve Studio 21.2): it builds, the unit
+tests and the fast system test pass, Resolve loads it, and with the test worker (no model) Process,
+the cache, the matte in the viewer and Collect Logs work in Resolve. Setup installs the runtime
+(Python 3.14, PyTorch 2.13 for CUDA 13.2) and finds the GPU.
+
+**What has not been tested yet:** the real model on Windows. That means the model download, and a
+real matte in any of the memory modes below. The memory estimates for Windows are worked out
+from upstream's Linux measurements, not measured. Fusion Studio and the Edit and Color pages are
+untested on Windows too. If you try it, **Collect Logs** has what is needed to fix what breaks.
+
+**What you need**
+
+- An NVIDIA card with a current driver. AMD and Intel cards can't run it.
+- GPU memory: the model's weights are about 42 GB (bf16) or about half that (fp8), so they only
+  fit the largest cards. On smaller cards the plugin keeps them in system memory and sends them
+  to the GPU a layer at a time, so a 24 GB card should do (not yet measured). That needs about
+  26 GB of free system memory in fp8 or 48 GB in bf16; with less, they are read from disk, slowly.
+- About 85 GB of disk space for the models and the runtime.
+- Nothing else: no Python and no compiler. Setup brings its own Python.
+
+**What is different from the Mac**
+
+- **Install:** `.\install.ps1` copies the plugin to
+  `C:\Program Files\Common Files\OFX\Plugins\LTXAlphaGen.ofx.bundle` (Windows asks for
+  administrator rights).
+- **Setup:** there is no Command Line Tools step. The Choose buttons open Explorer's folder picker.
+  **Link Existing Models** needs Windows' Developer Mode for a real link; without it Setup makes
+  a hard link when both folders are on one drive, and copies otherwise. There is no extra fp16
+  copy of the model.
+- **Performance** (a folded section, Windows only):
+
+  | Control | What it does |
+  |---|---|
+  | Precision | **bf16**: reference quality. **fp8**: the weights take about half the memory, with a slightly different matte. New nodes start on fp8 when bf16 does not fit the GPU. Needs Process. |
+  | Model Loading | Where the weights are kept. **Auto** (default): on the GPU when they fit its free memory, otherwise in system memory, otherwise read from disk. **On the GPU**, **In System Memory** and **From Disk** force one. The matte is the same. Needs Process. |
+
+- **Chunk Size:** Auto can use up to 145 frames at HD when the GPU has the memory (the Mac's size
+  limit does not apply).
+- **Folders:** the same names, in your user folder: `%USERPROFILE%\LTX-2.5` (models),
+  `%USERPROFILE%\.cache\ltx-alphagen` (mattes and the log, `logs\ltx-alphagen.log`),
+  `%USERPROFILE%\.config\ltx-alphagen` (settings). Collect Logs writes a `.zip` to your user
+  folder. To uninstall, delete those and the plugin folder above.
+
 ## Build from source
 
-You need the Xcode Command Line Tools and cmake (`brew install cmake`). Quit Resolve first.
+**Mac:** you need the Xcode Command Line Tools and cmake (`brew install cmake`). Quit Resolve first.
 
 ```bash
 ./build.sh --systest
@@ -319,6 +370,21 @@ You need the Xcode Command Line Tools and cmake (`brew install cmake`). Quit Res
 ```bash
 ./install.sh
 ```
+
+**Windows:** you need Visual Studio 2022 or its Build Tools with "Desktop development with C++",
+[CMake](https://cmake.org/download/), and Python 3.10 or later (or uv) on PATH. Quit Resolve first.
+In PowerShell:
+
+```powershell
+.\build.ps1 -Systest
+```
+
+```powershell
+.\install.ps1
+```
+
+If PowerShell says scripts are disabled, run them as
+`powershell -ExecutionPolicy Bypass -File .\build.ps1 -Systest`.
 
 The source is in `src/`, and every change from the Flame version is listed in
 `src/CVT_PORT.md`.

@@ -11,6 +11,14 @@
 #include <immintrin.h>
 #endif
 
+// Windows port: MSVC has no target attribute (it compiles these intrinsics as they are) and no
+// scalar _cvtss_sh / _cvtsh_ss, so there the tail goes through the 4-wide instruction.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define LTXAG_F16C
+#else
+#define LTXAG_F16C __attribute__((target("f16c,avx")))
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -42,24 +50,31 @@ inline void halfToFloat(const uint16_t* src, float* dst, size_t n) {
 
 #else
 
-__attribute__((target("f16c,avx"))) inline void floatToHalf(const float* src, uint16_t* dst,
-                                                           size_t n) {
+LTXAG_F16C inline void floatToHalf(const float* src, uint16_t* dst, size_t n) {
   size_t i = 0;
   for (; i + 8 <= n; i += 8) {
     const __m128i h = _mm256_cvtps_ph(_mm256_loadu_ps(src + i), _MM_FROUND_TO_NEAREST_INT);
     _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), h);
   }
+#if defined(_MSC_VER) && !defined(__clang__)
+  for (; i < n; ++i)
+    dst[i] = uint16_t(_mm_cvtsi128_si32(_mm_cvtps_ph(_mm_set_ss(src[i]), _MM_FROUND_TO_NEAREST_INT)));
+#else
   for (; i < n; ++i) dst[i] = _cvtss_sh(src[i], _MM_FROUND_TO_NEAREST_INT);
+#endif
 }
 
-__attribute__((target("f16c,avx"))) inline void halfToFloat(const uint16_t* src, float* dst,
-                                                           size_t n) {
+LTXAG_F16C inline void halfToFloat(const uint16_t* src, float* dst, size_t n) {
   size_t i = 0;
   for (; i + 8 <= n; i += 8) {
     const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
     _mm256_storeu_ps(dst + i, _mm256_cvtph_ps(h));
   }
+#if defined(_MSC_VER) && !defined(__clang__)
+  for (; i < n; ++i) dst[i] = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(src[i])));
+#else
   for (; i < n; ++i) dst[i] = _cvtsh_ss(src[i]);
+#endif
 }
 
 #endif

@@ -3,10 +3,13 @@
 // mattes back and compare with the expected luminance. Also checks cancel (kill)
 // and that the worker exits when its stdin closes.
 // Usage: test_worker_roundtrip <python> <dummy_worker.py>
+#ifndef _WIN32
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -51,7 +54,9 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string py = argv[1], script = argv[2];
+#ifndef _WIN32
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
 
   // 1. Round trip: 10 frames of 70x45 (pads to 96x64 and 17 frames inside the worker).
   const uint32_t W = 70, H = 45, N = 10;
@@ -132,7 +137,12 @@ int main(int argc, char** argv) {
     runWorker({py, "-I", "-B", script, "--in", in.path(), "--chunks", "0:1", "--out-prefix", out.path(), "--seconds", "0.1",
                "--simulate", "crash"},
               lines, status);
+#ifdef _WIN32
+    // Windows port: no signals; the dummy's os.kill(SIGSEGV) ends it with exit code 11.
+    CHECK(status == 11, "crash status %d", status);
+#else
     CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV, "crash status %d", status);
+#endif
   }
 
   // 4. Cancel: a hanging worker is killed promptly.
@@ -150,10 +160,17 @@ int main(int argc, char** argv) {
       w.readLines(50, lines);
     w.kill();
     const int status = w.wait();
+#ifdef _WIN32
+    CHECK(status == 9, "kill status %d", status);  // WorkerProcess::kill ends the job object with 9
+#else
     CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL, "kill status %d", status);
+#endif
   }
 
   // 5. Parent gone: closing the worker's stdin makes it exit on its own (status 3).
+  // Windows port: WorkerProcess closes the worker's stdin when it is destroyed, so the worker is
+  // left to outlive one (the job object would end it otherwise: the check is on the exit code).
+#ifndef _WIN32
   {
     StagingFile in("in"), out("out");
     int toChild[2];
@@ -183,6 +200,7 @@ int main(int argc, char** argv) {
     CHECK(r == pid && WIFEXITED(status) && WEXITSTATUS(status) == 3,
           "worker did not exit on stdin EOF (status %d)", status);
   }
+#endif
 
   if (failures) {
     std::fprintf(stderr, "%d failure(s)\n", failures);

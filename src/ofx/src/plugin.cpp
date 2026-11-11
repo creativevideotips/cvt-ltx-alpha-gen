@@ -9,13 +9,17 @@
 // - Licence + model gating (bypassable only in dev builds). Logging per decision 39.
 // Not in the prototype: OCIO (colour space only feeds the cache key), real model, resident worker.
 
+#ifndef _WIN32
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
+#ifndef _WIN32
 #include <signal.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -45,7 +49,11 @@
 #include "ofxColour.h"
 #include "ofxsImageEffect.h"
 #include "ofxsSupportPrivate.h"
+#include "oscompat.h"
 #include "platform.h"
+#ifdef _WIN32
+#include "platform_win.h"
+#endif
 #include "process.h"
 #include "roi.h"
 #include "transport.h"
@@ -97,6 +105,11 @@ constexpr const char* kOutputDisplay = "Rec.1886 Rec.709 - Display";
 const char* const kLegacyColourSpaces[] = {"Bypass", "ACEScg", "LogC4", "Log3G10", "LogC3", "BMD Film Gen5"};
 const char* const kPrecisions[] = {"bf16", "fp8"};
 const char* const kSimulations[] = {"none", "oom", "crash", "hang"};
+// Windows port: Model Loading, where the transformer's weights are kept while a chunk runs
+// (LTX-2's OffloadMode, ltx_pipelines/utils/types.py). Auto: on the GPU when the estimate fits
+// its free memory, else in system memory, else read from disk each time. Setups store the index.
+const char* const kOffloadNames[] = {"Auto", "On the GPU", "In System Memory", "From Disk"};
+constexpr int kOffloadChoices = 4;
 // Chunk Size (decision 61): index 0 is Auto, then chunk_plan.h kSizeLen. Setups store the index.
 // cvt1.29: Full (145) is gone from the choice: at HD it is over the Apple Silicon size limit
 // (vram_estimate.h). Auto still uses 145 when the picture is small enough (an ROI crop, 720p).
@@ -150,6 +163,7 @@ constexpr const char* kPPrecision = "precision";
 constexpr const char* kPUnload = "unloadAfterRun";
 constexpr const char* kPHeadroom = "headroomGB";
 constexpr const char* kPSaveDefault = "saveAsDefault";
+constexpr const char* kPOffload = "modelLoading";  // Windows port
 // [Licence] — per user: not saved in setups, mirrored to the user config.
 constexpr const char* kPViewLicence = "viewLicence";
 constexpr const char* kPAccept = "acceptLicence";
@@ -207,9 +221,14 @@ constexpr const char* kPColour = "colourSpace";  // the old Input Colour dropdow
 constexpr const char* kTokenCaptionDefault = "Hugging Face token:";
 
 std::string resourcesDir() {
+#ifdef _WIN32
+  std::string p = modulePath(reinterpret_cast<const void*>(&resourcesDir));  // .../Contents/Win64/LTXAlphaGen.ofx
+  if (p.empty()) return "";
+#else
   Dl_info info{};
   if (!dladdr(reinterpret_cast<void*>(&resourcesDir), &info) || !info.dli_fname) return "";
   std::string p = info.dli_fname;  // .../Contents/{Linux-x86-64,MacOS}/LTXAlphaGen.ofx
+#endif
   p = p.substr(0, p.rfind('/'));
   p = p.substr(0, p.rfind('/'));
   return p + "/Resources";
@@ -220,6 +239,7 @@ std::string resourcesDir() {
 // because running the stub, or xcrun, can open Apple's install window. Any real python3 counts, so
 // an unusual Xcode location that xcode-select knows about passes.
 // LTXAG_TEST_NO_APPLE_TOOLS: the system test's way to see the failure on a Mac that has them.
+#ifndef _WIN32
 bool appleToolsInstalled() {
   if (std::getenv("LTXAG_TEST_NO_APPLE_TOOLS")) return false;
   std::vector<std::string> roots = {"/Library/Developer/CommandLineTools",
@@ -233,11 +253,18 @@ bool appleToolsInstalled() {
     if (access((root + "/usr/bin/python3").c_str(), X_OK) == 0) return true;
   return false;
 }
+#endif
 
-std::string homeDir() {
-  const char* h = std::getenv("HOME");
-  return h ? h : "/tmp";
-}
+std::string homeDir() { return homeDirectory(); }
+
+// Windows port: what differs in the words shown to the user.
+#ifdef _WIN32
+constexpr const char* kFileManager = "Explorer";
+constexpr const char* kSystemPython = "python.exe";  // dev builds: found on PATH
+#else
+constexpr const char* kFileManager = "Finder";
+constexpr const char* kSystemPython = "/usr/bin/python3";
+#endif
 
 std::string timeStr(const char* fmt) {
   std::time_t t = std::time(nullptr);
@@ -250,8 +277,31 @@ std::string timeStr(const char* fmt) {
 
 // "/a/b/" -> "/a/b" (but "/" stays "/").
 std::string trimSlashes(std::string p) {
+#ifdef _WIN32
+  // Either slash; "C:\" stays (a drive's root).
+  while (p.size() > 3 && (p.back() == '/' || p.back() == '\\')) p.pop_back();
+#else
   while (p.size() > 1 && p.back() == '/') p.pop_back();
+#endif
   return p;
+}
+
+// A full path (not a relative one, which would depend on the host's current folder).
+bool absolutePath(const std::string& p) {
+#ifdef _WIN32
+  return isAbsolutePath(p);
+#else
+  return !p.empty() && p[0] == '/';
+#endif
+}
+
+// A folder that is missing only because its drive is away (it may come back).
+bool onMissingDrive(const std::string& p) {
+#ifdef _WIN32
+  return driveMissing(p);
+#else
+  return p.rfind("/Volumes/", 0) == 0;
+#endif
 }
 
 std::string fmtGB(double v) {
@@ -285,7 +335,7 @@ std::string jsonField(const std::string& j, const std::string& key) {
 }
 
 std::string readFile(const std::string& path) {
-  std::ifstream in(path);
+  std::ifstream in(fsPath(path));
   std::stringstream ss;
   ss << in.rdbuf();
   return ss.str();
@@ -302,10 +352,11 @@ std::string licenceHash() {
 
 // The Model Folder LTX Inpaint Still was set up with, "" if it hasn't been. They share the models.
 std::string inpaintStillModelFolder() {
-  std::ifstream in(homeDir() + "/.config/ltx-inpaint-still/config.conf");
+  std::ifstream in(fsPath(homeDir() + "/.config/ltx-inpaint-still/config.conf"));
   std::string line;
   while (std::getline(in, line))
     if (line.rfind("model_dir=", 0) == 0) {
+      if (line.back() == '\r') line.pop_back();  // a file edited on Windows
       struct stat st {};
       return stat(line.c_str() + 10, &st) == 0 ? line.substr(10) : "";
     }
@@ -422,6 +473,17 @@ std::string jsonStr(const std::string& s) {
     o += c;
   }
   return o + "\"";
+}
+
+// Windows port: how a Python script is started. -I -B as upstream (isolated, no .pyc files); on
+// Windows also UTF-8 mode, where Python otherwise reads and writes text in the ANSI code page
+// (the manifest and the config hold UTF-8 paths).
+std::vector<std::string> pythonCommand(const std::string& python) {
+#ifdef _WIN32
+  return {python, "-I", "-B", "-X", "utf8"};
+#else
+  return {python, "-I", "-B"};
+#endif
 }
 
 // OpenFX 1.5 colour properties through the raw property suite (the 1.4 Support library has no
@@ -603,6 +665,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     precision_ = fetchChoiceParam(kPPrecision);
     unload_ = fetchBooleanParam(kPUnload);
     headroom_ = fetchDoubleParam(kPHeadroom);
+    offload_ = fetchChoiceParam(kPOffload);
     accept_ = fetchBooleanParam(kPAccept);
     tokenCaption_ = fetchStringParam(kPTokenCaption);
     token_ = fetchStringParam(kPToken);
@@ -675,7 +738,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
       struct stat modelStat {};
       const std::string ownModels = cfg.count("model_dir") ? cfg.at("model_dir") : "";
       const bool leftOver = !ownModels.empty() && cfg.count("models_ready") && stat(ownModels.c_str(), &modelStat) != 0 &&
-                            ownModels.rfind("/Volumes/", 0) != 0;
+                            !onMissingDrive(ownModels);
       const std::string otherModels = ownModels.empty() || leftOver ? inpaintStillModelFolder() : "";
       if (!ownModels.empty() && !leftOver) modelDir_->setValue(ownModels);
       else if (!otherModels.empty()) modelDir_->setValue(otherModels);
@@ -810,7 +873,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     std::string start;
     field->getValue(start);
     struct stat st {};
-    if (start.empty() || start[0] != '/' || stat(start.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) start = homeDir();
+    if (!absolutePath(start) || stat(start.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) start = homeDir();
     const std::string node = nodeId_, title = prompt, key = configKey;
     browseThread_ = std::thread([this, field, node, title, start, key] {
       LogScope scope(node);
@@ -821,11 +884,17 @@ class AlphaGenEffect : public OFX::ImageEffect {
       }
       std::string err;
       std::vector<std::string> lines;
-      if (proc->start({"/usr/bin/osascript", "-e", "on run argv", "-e", "activate", "-e",
-                       "return POSIX path of (choose folder with prompt (item 1 of argv) default location "
-                       "(POSIX file (item 2 of argv) as alias))",
-                       "-e", "end run", title, start},
-                      cleanEnvironment(), err)) {
+#ifdef _WIN32
+      // Windows port: the bundle's own helper shows Explorer's folder picker and prints the choice.
+      const std::vector<std::string> picker = {uiHelper(resourcesDir()), "folder", title, backSlashes(start)};
+#else
+      const std::vector<std::string> picker = {
+          "/usr/bin/osascript", "-e", "on run argv", "-e", "activate", "-e",
+          "return POSIX path of (choose folder with prompt (item 1 of argv) default location "
+          "(POSIX file (item 2 of argv) as alias))",
+          "-e", "end run", title, start};
+#endif
+      if (proc->start(picker, cleanEnvironment(), err)) {
         while (proc->readLines(200, lines)) {
         }
         proc->wait();
@@ -837,8 +906,8 @@ class AlphaGenEffect : public OFX::ImageEffect {
         browseProc_.reset();
       }
       std::string chosen = lines.empty() ? "" : lines.front();
-      while (chosen.size() > 1 && chosen.back() == '/') chosen.pop_back();
-      if (!chosen.empty() && chosen[0] == '/') {
+      chosen = trimSlashes(chosen);
+      if (absolutePath(chosen)) {
         try {
           field->setValue(chosen);
           if (!key.empty()) {  // a change made here isn't a user edit, so it is saved here
@@ -866,7 +935,12 @@ class AlphaGenEffect : public OFX::ImageEffect {
 
   void openPage(const char* url) {
     std::string err;
-    if (launchDetached({"/usr/bin/open", url}, cleanEnvironment(), err))
+#ifdef _WIN32
+    const bool opened = openUrl(url, err);
+#else
+    const bool opened = launchDetached({"/usr/bin/open", url}, cleanEnvironment(), err);
+#endif
+    if (opened)
       LOGI("web page: opened %s", url);
     else
       LOGE("web page: FAILED %s: %s", url, err.c_str());
@@ -1422,7 +1496,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
   void refreshSetupUi() {
     const SetupState st = setupState();
     const bool closed = gateClosed();
-    for (const char* p : {kPColourMode, kPOutput, kPPostMultiply, kPBlackClip, kPWhiteClip, kPRefresh, kPProcess, kPShowMarker, kPPurgeNode, kPPrecision, kPUnload,
+    for (const char* p : {kPColourMode, kPOutput, kPPostMultiply, kPBlackClip, kPWhiteClip, kPRefresh, kPProcess, kPShowMarker, kPPurgeNode, kPPrecision, kPOffload, kPUnload,
                           kPHeadroom, kPSaveDefault, kPChunkSize, kPMerge, kPSkipMemCheck, kPFirstFrame, kPLastFrame,
                           kPRoiMargin, kPRoiMask, kPRoiLimit}) {
       try {
@@ -1575,7 +1649,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
     if (!state.empty() && state != "running") return false;
     if (std::chrono::steady_clock::now() - launched < std::chrono::seconds(20)) return true;  // just started
     const std::string pid = readFile(stagingDir() + "/ltxag_job_" + id + ".pid");
-    return !pid.empty() && kill(pid_t(std::atoi(pid.c_str())), 0) == 0;
+    return !pid.empty() && pidAlive(std::atoi(pid.c_str()));
   }
 
   std::string lastJobStatus() {
@@ -1591,11 +1665,13 @@ class AlphaGenEffect : public OFX::ImageEffect {
 #if LTXAG_DEV_BUILD
     std::string p;
     python_->getValue(p);
-    return p.empty() ? "/usr/bin/python3" : p;
+    return p.empty() ? kSystemPython : p;
 #else
     // cvt1.43: fixed in a release. The Worker Python setting is saved with a comp, so a comp from
     // someone else could otherwise choose the program that Process or Download starts.
-    return "/usr/bin/python3";
+    // Windows has no system Python: there a release build never uses this (Download runs the
+    // bundled uv, and jobs run under the runtime Setup installed).
+    return kSystemPython;
 #endif
   }
 
@@ -1632,6 +1708,36 @@ class AlphaGenEffect : public OFX::ImageEffect {
     return std::atof(jsonField(info, "vram_gb").c_str());
   }
 
+  // Windows port: where the transformer's weights are kept for a chunk, and the GPU memory that
+  // then takes. LTX-2 can keep them in system memory (or read them from disk) and send them to
+  // the GPU a layer at a time (OffloadMode, ltx_pipelines/utils/types.py), which is what makes a
+  // 22B model run on a 24 GB card: only the picture's own data must fit. Model Loading = Auto
+  // keeps them on the GPU when the estimate fits its free memory (the fastest), else in system
+  // memory when enough of that is free, else on disk. availableGB < 0: not known (no NVML), then
+  // Auto leaves them on the GPU, as before. Apple Silicon has one memory for both: never.
+  struct MemoryPlan {
+    VramNeed need;
+    const char* offload;  // "none", "cpu" or "disk": the manifest's and the worker's word
+    const char* where() const {
+      return offload[0] == 'n' ? "on the GPU" : offload[0] == 'c' ? "in system memory" : "read from disk";
+    }
+  };
+
+  MemoryPlan planMemory(bool fp8, int w, int h, int modelFrames, bool resident, double availableGB) {
+    int mode = 0;
+    offload_->getValue(mode);
+    mode = std::min(std::max(mode, 0), kOffloadChoices - 1);
+    const VramNeed onGpu = estimateVramNeed(fp8, w, h, modelFrames, resident, memoryFit(fp8 ? 1 : 0));
+    if (kMps || mode == 1 || (mode == 0 && (availableGB < 0.0 || onGpu.gb <= availableGB))) return {onGpu, "none"};
+    // In system memory the weights are pinned: 42 GB in bf16, about half in fp8, plus working room.
+    bool ramFits = true;
+#ifdef _WIN32
+    ramFits = availableRamBytes() / 1073741824.0 >= (fp8 ? 26.0 : 48.0);
+#endif
+    const char* where = mode == 3 ? "disk" : mode == 2 ? "cpu" : ramFits ? "cpu" : "disk";
+    return {estimateVramNeed(fp8, w, h, modelFrames, false, 0, true), where};
+  }
+
   // Decision 61: Auto takes the longest chunk size whose estimated need fits the available
   // memory, else the smallest. Without NVML it takes Full. The overlap goes with the size.
   // With a Frame Hold (74) the model frames of a chunk are what counts.
@@ -1642,9 +1748,11 @@ class AlphaGenEffect : public OFX::ImageEffect {
     unsigned pid = 0;
     const double available = v.freeGB + residentWorkerGB(pid) - head;
     for (int s = 0; s < kChunkSizes; ++s) {
-      const VramNeed n =
-          estimateVramNeed(fp8, w, h, heldModelFrames(std::min(heldChunkLen(s, hold), frames), hold), resident, memoryFit(fp8 ? 1 : 0));
-      LOGI("chunk size auto: %d frames/chunk needs %.1f GB, available %.1f GB%s", kSizeLen[s], n.gb, available,
+      const MemoryPlan plan =
+          planMemory(fp8, w, h, heldModelFrames(std::min(heldChunkLen(s, hold), frames), hold), resident, available);
+      const VramNeed& n = plan.need;
+      LOGI("chunk size auto: %d frames/chunk needs %.1f GB (weights %s), available %.1f GB%s", kSizeLen[s], n.gb,
+           plan.where(), available,
            n.overMpsLimit ? "; over the Apple Silicon size limit" : "");
       if (n.overMpsLimit) continue;  // cvt1.28: MPS can't run it at all
       if (n.gb <= available) return s;
@@ -1653,7 +1761,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
   }
 
   // modelFrames: of the largest chunk, holds included (74/75).
-  bool preflight(int modelFrames, int w, int h, std::string& vramJson) {
+  bool preflight(int modelFrames, int w, int h, std::string& vramJson, std::string& offload) {
     int prec = 0;
     double head = 0.0, simNeed = 0.0;
     bool unload = true;
@@ -1661,12 +1769,15 @@ class AlphaGenEffect : public OFX::ImageEffect {
     headroom_->getValue(head);
     unload_->getValue(unload);
     simNeed_->getValue(simNeed);
-    const VramNeed est = estimateVramNeed(prec == 1, w, h, modelFrames, !unload, memoryFit(prec));
-    const double need = simNeed > 0.0 ? simNeed : est.gb;
     const VramInfo v = queryVram();
     unsigned workerPid = 0;
     const double reusable = residentWorkerGB(workerPid);
     const double available = v.freeGB + reusable - head;
+    const MemoryPlan plan = planMemory(prec == 1, w, h, modelFrames, !unload, v.ok ? available : -1.0);
+    const VramNeed est = plan.need;
+    offload = plan.offload;
+    const double need = simNeed > 0.0 ? simNeed : est.gb;
+    if (!kMps) LOGI("preflight: model weights %s (offload %s)", plan.where(), plan.offload);
     LOGI("preflight: %s %dx%d largest chunk %d model frames -> model %dx%dx%d, need %.1f GB%s; free %.1f + resident "
          "%.1f - reserve %.1f = %.1f GB available (nvml %s)",
          effectivePrecision(prec).c_str(), w, h, modelFrames, est.modelW, est.modelH, est.modelFrames, need,
@@ -1722,7 +1833,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
              (kMps ? "still work; if not, macOS swaps memory to disk and the job (and the Mac) slows down "
                      "badly. A smaller Chunk Size needs less."  // Metal over-commit swaps (devices.py)
                    : "still work; if not, the job stops with an out-of-memory error and " + hostShort() + " is not affected.") +
-             (!kMps && prec == 0 ? " fp8 needs about 17 GB less." : "") + "\n\nProcess anyway?";
+             (!kMps && prec == 0 && offload == "none" ? " fp8 needs about 17 GB less." : "") + "\n\nProcess anyway?";
       const OFX::Message::MessageReplyEnum reply = sendMessage(OFX::Message::eMessageQuestion, "", msg);
       LOGI("preflight: warning shown, reply %d (0 OK, 1 Yes, 2 No, 3 Failed)", int(reply));
       if (reply == OFX::Message::eMessageReplyNo) return false;
@@ -1730,7 +1841,8 @@ class AlphaGenEffect : public OFX::ImageEffect {
         // CVT Resolve port: Resolve can't ask Yes/No (reply Failed) and refuses persistent
         // messages, which threw and ended Process. On a Mac an over-committed run swaps the
         // whole machine instead of failing cleanly, so without an answer it stops here.
-        error("Too large for this Mac's memory: needs about " + fmtGB(need) + " GB, " + fmtGB(available) +
+        error(std::string("Too large for this ") + (kMps ? "Mac's memory" : "GPU's memory") + ": needs about " +
+              fmtGB(need) + " GB, " + fmtGB(available) +
               " GB available. Scale the clip down before this node (UHD to HD), give it an alpha "
               "ROI, or choose a smaller Chunk Size. Or tick Skip Memory Check (Speed and Quality) "
               "to try anyway.");
@@ -1868,8 +1980,8 @@ class AlphaGenEffect : public OFX::ImageEffect {
     LOGI("process: chunk size %s -> %d model frames, overlap %d; frame hold %s; merge %s",
          kChunkSizeNames[chunkMode], kSizeLen[sizeIdx], overlap, kFrameHoldNames[std::min(kFrameHoldChoices - 1, std::max(0, frameHoldIndex()))],
          kMergeNames[mergeMode]);
-    std::string vramJson;
-    if (!preflight(modelFrames, roi.box.w, roi.box.h, vramJson)) return;
+    std::string vramJson, offload;
+    if (!preflight(modelFrames, roi.box.w, roi.box.h, vramJson, offload)) return;
     const std::string sig = paramSignature(&roi);
     const std::string root = cacheRoot();
     const std::string jobId = std::to_string(getpid()) + "-" + std::to_string(gJobSeq++) + "-" +
@@ -2024,12 +2136,13 @@ class AlphaGenEffect : public OFX::ImageEffect {
     }
     js
        << ",\"seconds\":" << seconds << ",\"simulate\":" << jsonStr(kSimulations[sim])
-       << ",\"precision\":" << jsonStr(effectivePrecision(prec)) << ",\"vram\":" << vramJson
+       << ",\"precision\":" << jsonStr(effectivePrecision(prec)) << ",\"offload\":" << jsonStr(offload)
+       << ",\"vram\":" << vramJson
        << ",\"flame_pid\":" << getpid()
        << ",\"title\":" << jsonStr("LTX Alpha Gen - " + std::to_string(n) + " frames") << "}";
     const std::string manifest = stagingDir() + "/ltxag_job_" + jobId + ".json";
     {
-      std::ofstream mf(manifest);
+      std::ofstream mf(fsPath(manifest), std::ios::binary);
       mf << js.str();
     }
     chmod(manifest.c_str(), 0600);  // cvt1.43: Resolve's umask is 000, and this file tells a job what to do
@@ -2044,15 +2157,15 @@ class AlphaGenEffect : public OFX::ImageEffect {
     markPending(root, keys, getpid());
     // job.py needs numpy: the system python3 has it on Rocky 9 but not on macOS, where the job
     // runs under the LTX runtime's own Python (decision 65; Setup is stdlib-only and keeps
-    // pythonPath()).
-#ifdef __APPLE__
+    // pythonPath()). Windows port: the same there, which has no system Python at all.
+#if defined(__APPLE__) || defined(_WIN32)
     const std::string jobPython = ltxPython.empty() ? pythonPath() : ltxPython;
 #else
     const std::string jobPython = pythonPath();
 #endif
-    const bool ok = launchDetached(
-        {jobPython, "-I", "-B", resourcesDir() + "/worker/job.py", manifest},
-        cleanEnvironment({"LTXAG_LOG_LEVEL=" + level}), err);
+    std::vector<std::string> jobArgv = pythonCommand(jobPython);
+    jobArgv.insert(jobArgv.end(), {resourcesDir() + "/worker/job.py", manifest});
+    const bool ok = launchDetached(jobArgv, cleanEnvironment({"LTXAG_LOG_LEVEL=" + level}), err);
     if (!ok) {
       clearPending(root, keys);
       unlink(input.c_str());
@@ -2277,15 +2390,45 @@ class AlphaGenEffect : public OFX::ImageEffect {
     if (!setupState().licenceAccepted)
       return error("Accept the LTX-2 Community License before downloading.");
     // cvt1.42: before the token is used and cleared, so it is still there for the next try.
+#ifndef _WIN32
     if (pythonPath() == "/usr/bin/python3" && !appleToolsInstalled())
       return error("Apple's Command Line Tools are missing. In Terminal, run xcode-select --install, "
                    "then press Download again.");
+#endif
     // The token is optional: everything may already be in the Model Folder or the Existing
     // Models folder (decision 51). The helper says which files still need it.
     std::string err;
     const std::string helper = resourcesDir() + "/helper/setup_helper.py";
-    std::vector<std::string> argv = {pythonPath(), "-I", "-B", helper, "--model-dir", dir,
-                                     "--cache-root", cacheRoot()};
+    const std::string level = logLevel() == LogLevel::Debug ? "debug" : "info";
+    Env extras = {"LTXAG_LOG_LEVEL=" + level};
+    std::vector<std::string> argv;
+#ifdef _WIN32
+    // Windows port: there is no system Python to start Setup with, so the bundle carries uv
+    // (build.ps1), which fetches the pinned Python into the Model Folder's runtime and runs the
+    // helper with it; Setup then uses the same uv and the same Python for the rest. Dev builds:
+    // a Worker Python that is set runs the helper directly (the system test).
+    std::string devPython;
+#if LTXAG_DEV_BUILD
+    python_->getValue(devPython);
+#endif
+    if (!devPython.empty()) {
+      argv = pythonCommand(devPython);
+    } else {
+      const std::string uv = bundledUv(resourcesDir());
+      const std::string pyVersion = jsonField(readFile(resourcesDir() + "/helper/model_manifest.json"), "python");
+      if (uv.empty() || pyVersion.empty())
+        return error("This copy of the plugin has no uv.exe beside it (build.ps1 puts it there), so Setup "
+                     "can't start. Install the plugin again.");
+      const std::string rt = dir + "/runtime";
+      argv = {uv,       "run", "--no-project", "--no-config", "--managed-python", "--python", pyVersion,
+              "python", "-I",  "-B",           "-X",          "utf8"};
+      extras.insert(extras.end(), {"UV_CACHE_DIR=" + rt + "/uv-cache", "UV_PYTHON_INSTALL_DIR=" + rt + "/python",
+                                   "UV_NO_PROGRESS=1", "LTXAG_UV=" + uv});
+    }
+#else
+    argv = pythonCommand(pythonPath());
+#endif
+    argv.insert(argv.end(), {helper, "--model-dir", dir, "--cache-root", cacheRoot()});
     if (!existing.empty()) {
       argv.insert(argv.end(), {"--existing", existing});
       // Decision 66: link to the existing files instead of copying them. cvt1.47: a checkbox, because
@@ -2294,8 +2437,6 @@ class AlphaGenEffect : public OFX::ImageEffect {
       linkExisting_->getValue(link);
       if (link) argv.push_back("--link");
     }
-    const std::string level = logLevel() == LogLevel::Debug ? "debug" : "info";
-    Env extras = {"LTXAG_LOG_LEVEL=" + level};
     if (!token.empty()) extras.push_back("HF_TOKEN=" + token);
     const bool ok = launchDetached(argv, cleanEnvironment(extras), err);
     token.assign(token.size(), '\0');
@@ -2312,18 +2453,26 @@ class AlphaGenEffect : public OFX::ImageEffect {
   void collectLogs() {
     const std::string dir = logDir();
     {
-      std::ofstream envf(dir + "/environment.txt");
+      std::ofstream envf(fsPath(dir + "/environment.txt"));
       for (const auto& line : environmentSnapshot(hostInfo(), resourcesDir())) envf << line << "\n";
     }
     chmod((dir + "/environment.txt").c_str(), 0644);  // cvt1.43
+#ifdef _WIN32
+    // Windows port: a zip, made by the tar.exe that Windows 10 and 11 carry (bsdtar: -a picks the
+    // format from the name).
+    const std::string bundle = homeDir() + "/ltx-alphagen-support-" + timeStr("%Y%m%d-%H%M%S") + ".zip";
+    std::vector<std::string> argv = {systemTool("tar.exe"), "-a", "-c", "-f", backSlashes(bundle), "-C",
+                                     backSlashes(dir.substr(0, dir.rfind('/'))), "logs"};
+#else
     const std::string bundle =
         homeDir() + "/ltx-alphagen-support-" + timeStr("%Y%m%d-%H%M%S") + ".tar.gz";
     std::vector<std::string> argv = {"/usr/bin/tar", "-czf", bundle, "-C",
                                      dir.substr(0, dir.rfind('/')), "logs"};
+#endif
     const std::string root = cacheRoot();
     struct stat st {};
     if (stat((root + "/jobs").c_str(), &st) == 0) {
-      argv.insert(argv.end(), {"-C", root, "jobs"});
+      argv.insert(argv.end(), {"-C", trimSlashes(root), "jobs"});
     }
     std::string err;
     WorkerProcess tar;
@@ -2360,6 +2509,7 @@ class AlphaGenEffect : public OFX::ImageEffect {
   OFX::ChoiceParam* precision_;
   OFX::BooleanParam* unload_;
   OFX::DoubleParam* headroom_;
+  OFX::ChoiceParam* offload_;  // Windows port: Model Loading
   OFX::BooleanParam* accept_;
   OFX::StringParam* tokenCaption_;
   OFX::StringParam* token_;
@@ -2641,10 +2791,14 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     // CVT port (cvt1.05): hidden. One GPU, one precision (bf16), and the defaults (unload after
     // each job, reserve 5% of free memory) are right for a single Mac; the params stay defined so
     // saved comps load.
+    // Windows port: on an NVIDIA card the group shows, folded, with Precision and Model Loading:
+    // there the choices are real (bf16 or fp8, and where the weights are kept).
     auto* gPerf = group("grpPerf", "Performance", main, false);
-    gPerf->setIsSecret(true);
+    if (kMps) gPerf->setIsSecret(true);
     auto* prec = labelled(desc.defineChoiceParam(kPPrecision), "Precision",
-                          "bf16: reference quality. fp8: about half the GPU memory.");
+                          "bf16: reference quality. fp8: the model's weights take about half the "
+                          "memory, with a slightly different matte. New nodes start on fp8 when bf16 "
+                          "does not fit the GPU. Needs Process.");
     for (const char* p : kPrecisions) prec->appendOption(p);
     prec->setDefault(d.precision);
     // CVT Resolve port (Apple Silicon only): MPS has no fp8, so bf16 (or Setup's fp16 copy, 68)
@@ -2652,6 +2806,21 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     if (kMps) prec->setIsSecret(true);
     still(prec);
     place(*prec, gPerf);
+    // Windows port: where the model's weights are kept (planMemory). Defined on every platform, so
+    // a comp moves between them; hidden on Apple Silicon, which has one memory for both.
+    auto* offl = labelled(desc.defineChoiceParam(kPOffload), "Model Loading",
+                          "Where the model's weights are kept while it runs. Auto: on the GPU when "
+                          "they fit its free memory (fastest), otherwise in system memory and sent "
+                          "to the GPU a layer at a time, which is how the model runs on a 24 GB "
+                          "card. In System Memory needs about 48 GB of free memory in bf16, 26 GB "
+                          "in fp8. From Disk needs the least memory and is the slowest. The matte "
+                          "is the same. Needs Process.");
+    for (const char* c : kOffloadNames) offl->appendOption(c);
+    offl->setDefault(0);
+    offl->setEvaluateOnChange(false);
+    if (kMps) offl->setIsSecret(true);
+    still(offl);
+    place(*offl, gPerf);
     const std::string host = hostShort();
     const std::string unloadHint = "Return all GPU memory to " + host +
                                    " when this node's processing ends. Turn off on all but the last "
@@ -2697,10 +2866,13 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
       place(*p, gChunk);
     }
     auto* csize = labelled(desc.defineChoiceParam(kPChunkSize), "Chunk Size",
-                           "Frames per model run. Auto: the longest that fits the free memory and the "
-                           "Mac's size limit: up to 145 frames for small pictures (a Guided ROI "
-                           "crop, 720p), 73 at HD. Smaller chunks need less memory but have more seams, "
-                           "and the model may pick a different main object in each chunk.");
+                           kMps ? "Frames per model run. Auto: the longest that fits the free memory and the "
+                                  "Mac's size limit: up to 145 frames for small pictures (a Guided ROI "
+                                  "crop, 720p), 73 at HD. Smaller chunks need less memory but have more seams, "
+                                  "and the model may pick a different main object in each chunk."
+                                : "Frames per model run. Auto: the longest that fits the GPU's free memory, "
+                                  "up to 145 frames. Smaller chunks need less memory but have more seams, "
+                                  "and the model may pick a different main object in each chunk.");
     for (const char* c : kChunkSizeNames) csize->appendOption(c);
     csize->setDefault(0);
     csize->setEvaluateOnChange(false);
@@ -2744,10 +2916,14 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     place(*oldHold, gChunk);
     // cvt1.27: process even when the memory estimate says it won't fit.
     auto* skipMem = labelled(desc.defineBooleanParam(kPSkipMemCheck), "Skip Memory Check",
-                             "Process even when the memory estimate says the clip won't fit. The "
-                             "estimate is cautious, so it may work; if it doesn't, macOS swaps to "
-                             "disk and the job (and the Mac) slows down badly, or the job fails. "
-                             "Nothing is damaged. For Macs near the limit, such as a 64 GB M1 Max.");
+                             kMps ? "Process even when the memory estimate says the clip won't fit. The "
+                                    "estimate is cautious, so it may work; if it doesn't, macOS swaps to "
+                                    "disk and the job (and the Mac) slows down badly, or the job fails. "
+                                    "Nothing is damaged. For Macs near the limit, such as a 64 GB M1 Max."
+                                  : "Process even when the memory estimate says the clip won't fit the "
+                                    "GPU. The estimate is cautious, so it may work; if it doesn't, the "
+                                    "job slows down badly (the driver spills into system memory) or "
+                                    "stops with an out-of-memory error. Nothing is damaged.");
     skipMem->setDefault(false);
     skipMem->setEvaluateOnChange(false);
     still(skipMem);
@@ -2800,7 +2976,8 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     cdir->setDefault(homeDir() + "/.cache/ltx-alphagen/mattes");
     perUser(cdir);
     place(*cdir, gCache);
-    place(*button(kPChooseCache, "Choose Cache Folder", "Pick the folder in Finder."), gCache);
+    const std::string pickHint = std::string("Pick the folder in ") + kFileManager + ".";
+    place(*button(kPChooseCache, "Choose Cache Folder", pickHint.c_str()), gCache);
     place(*label(kPCacheInfo, "Cache Size", ""), gCache);
     // cvt1.14: the size limit, per user (was a fixed 50 GB unless set in the config file).
     auto* climit = labelled(desc.defineDoubleParam(kPCacheLimit), "Cache Limit (GB)",
@@ -2882,14 +3059,15 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
 
     // --- Models (5 rows, per user) ---
     auto* dir = labelled(desc.defineStringParam(kPModelDir), "Model Folder",
-                         "Where the models and the LTX runtime are installed (about 80 GB, or about "
-                         "125 GB on M1 and M2 Macs, where Setup adds a faster copy of the main "
-                         "model).");
+                         kMps ? "Where the models and the LTX runtime are installed (about 80 GB, or about "
+                                "125 GB on M1 and M2 Macs, where Setup adds a faster copy of the main "
+                                "model)."
+                              : "Where the models and the LTX runtime are installed (about 85 GB).");
     dir->setStringType(OFX::eStringTypeSingleLine);
     dir->setDefault(homeDir() + "/LTX-2.5");  // cvt1.46: one folder for every LTX-2.5 plugin
     perUser(dir);
     place(*dir, gModels);
-    place(*button(kPChooseModel, "Choose Model Folder", "Pick the folder in Finder."), gModels);
+    place(*button(kPChooseModel, "Choose Model Folder", pickHint.c_str()), gModels);
     auto* ex = labelled(desc.defineStringParam(kPExistingDir), "Existing Models",
                         "Optional: a folder that may already contain the model files (e.g. a ComfyUI "
                         "models folder). Matching files are verified and copied instead of downloaded.");
@@ -2897,7 +3075,7 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     ex->setDefault("");
     perUser(ex);
     place(*ex, gModels);
-    place(*button(kPChooseExisting, "Choose Existing Models", "Pick the folder in Finder."), gModels);
+    place(*button(kPChooseExisting, "Choose Existing Models", pickHint.c_str()), gModels);
     auto* linkExisting = labelled(desc.defineBooleanParam(kPLinkExisting), "Link Existing Models",
                                   "Link to the files in Existing Models instead of copying them: saves up to 73 GB, but that "
                                   "folder must stay where it is and stay available. Off: they are copied into the Model Folder.");
@@ -2951,7 +3129,7 @@ class AlphaGenFactory : public OFX::PluginFactoryHelper<AlphaGenFactory> {
     auto* py = labelled(desc.defineStringParam(kPPython), "Worker Python",
                         "Python used for the worker and helpers.");
     py->setStringType(OFX::eStringTypeFilePath);
-    py->setDefault("/usr/bin/python3");
+    py->setDefault(kSystemPython);
     auto* gate = labelled(desc.defineBooleanParam(kPEnforceGate), "Enforce Gate",
                           "Apply the licence/model gate as a release build would.");
     gate->setDefault(false);

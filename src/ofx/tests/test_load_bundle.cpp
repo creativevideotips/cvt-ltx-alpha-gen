@@ -1,7 +1,11 @@
 // Loads the built .ofx the way a host does (dlopen + the two OFX entry points)
 // and checks the plugin identity. Catches unresolved symbols before Flame does.
 // Usage: test_load_bundle <path to LTXAlphaGen.ofx>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -11,6 +15,16 @@
 
 int main(int argc, char** argv) {
   if (argc != 2) return 2;
+#ifdef _WIN32
+  // Windows port: LoadLibrary, as a Windows host loads the .ofx.
+  const HMODULE lib = LoadLibraryA(argv[1]);
+  if (!lib) {
+    std::fprintf(stderr, "LoadLibrary failed: error %lu\n", GetLastError());
+    return 1;
+  }
+  auto count = reinterpret_cast<int (*)()>(reinterpret_cast<void*>(GetProcAddress(lib, "OfxGetNumberOfPlugins")));
+  auto get = reinterpret_cast<OfxPlugin* (*)(int)>(reinterpret_cast<void*>(GetProcAddress(lib, "OfxGetPlugin")));
+#else
   void* lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
   if (!lib) {
     std::fprintf(stderr, "dlopen failed: %s\n", dlerror());
@@ -18,6 +32,7 @@ int main(int argc, char** argv) {
   }
   auto count = reinterpret_cast<int (*)()>(dlsym(lib, "OfxGetNumberOfPlugins"));
   auto get = reinterpret_cast<OfxPlugin* (*)(int)>(dlsym(lib, "OfxGetPlugin"));
+#endif
   if (!count || !get) {
     std::fprintf(stderr, "entry points missing\n");
     return 1;

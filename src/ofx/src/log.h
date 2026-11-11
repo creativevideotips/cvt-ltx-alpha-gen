@@ -23,7 +23,12 @@ bool logEnabled(LogLevel level);
 // Keeps at most `keep` rotated files of about `maxBytes` each. Called at plugin load.
 void rotateLogs(size_t maxBytes = 10u << 20, int keep = 5);
 
-void logAt(LogLevel level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+#if defined(__GNUC__) || defined(__clang__)
+#define LTXAG_PRINTF(fmt, args) __attribute__((format(printf, fmt, args)))
+#else
+#define LTXAG_PRINTF(fmt, args)  // Windows port: MSVC has no such attribute
+#endif
+void logAt(LogLevel level, const char* fmt, ...) LTXAG_PRINTF(2, 3);
 
 #define LOGD(...) ::ltxag::logAt(::ltxag::LogLevel::Debug, __VA_ARGS__)
 #define LOGI(...) ::ltxag::logAt(::ltxag::LogLevel::Info, __VA_ARGS__)

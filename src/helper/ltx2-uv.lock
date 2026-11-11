@@ -5132,7 +5132,7 @@ dependencies = [
 wheels = [
     { url = "https://download.pytorch.org/whl/test/cu132/torchaudio-2.11.1%2Bcu132-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:c209dfff6500d7d0f095651be86af68457cc24dc933423f633cf43c13a208575", upload-time = "2026-10-08T14:36:10Z" },
     { url = "https://download.pytorch.org/whl/test/cu132/torchaudio-2.11.1%2Bcu132-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:f51f8e708924687935c0c24f616464326b6bc659a69ffdbe0e6a2fee00ee39db", upload-time = "2026-10-08T14:38:03Z" },
-    { url = "https://download.pytorch.org/whl/test/cu132/torchaudio-2.11.1%2Bcu132-py3-none-win_amd64.whl", hash = "sha256:3829a69b3d8c2edda067bbdda399e3a827f411ee2d76907c2c92a6a3ad8baafe", upload-time = "2026-10-08T15:01:47Z" },
+    { url = "https://download.pytorch.org/whl/test/cu132/torchaudio-2.11.1%2Bcu132-py3-none-win_amd64.whl", hash = "sha256:c3a9228e74828810bc7afcf6cc3df5bd8f6557ba07fc73d14d66c981b221b3ab", upload-time = "2026-10-08T15:01:47Z" },
 ]
 
 [[package]]

@@ -15,6 +15,9 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "helper"))
 import setup_helper  # noqa: E402
 
 DATA = b"model weights" * 1000
+# Windows port: the variable that names the user's folder (where ~ points, so the config, cache
+# and log of a test stay out of the real ones).
+HOME_VAR = "USERPROFILE" if sys.platform == "win32" else "HOME"
 
 
 def manifest(sha: str) -> dict:
@@ -26,8 +29,8 @@ class ExistingModelsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         root = self.tmp.name
-        self.home = os.environ.get("HOME")
-        os.environ["HOME"] = root  # the helper logs to ~/.cache: keep it out of the real log
+        self.home = os.environ.get(HOME_VAR)
+        os.environ[HOME_VAR] = root  # the helper logs to ~/.cache: keep it out of the real log
         self.existing = os.path.join(root, "existing", "sub")
         os.makedirs(self.existing)
         self.src = os.path.join(self.existing, "m.safetensors")
@@ -40,8 +43,13 @@ class ExistingModelsTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         if self.home is not None:
-            os.environ["HOME"] = self.home
+            os.environ[HOME_VAR] = self.home
         self.tmp.cleanup()
+
+    def linked(self) -> bool:
+        """A symlink; on Windows also a hard link (setup_helper.link_to: a symlink needs Developer
+        Mode or admin rights there)."""
+        return os.path.islink(self.dst) or (sys.platform == "win32" and os.path.samefile(self.dst, self.src))
 
     def gather(self, link: bool, man: dict | None = None) -> dict:
         return setup_helper.gather_models(man or self.man, self.models, os.path.dirname(self.existing), "",
@@ -50,12 +58,12 @@ class ExistingModelsTest(unittest.TestCase):
     def test_link(self):
         s = self.gather(link=True)
         self.assertEqual(len(s["linked"]), 1)
-        self.assertTrue(os.path.islink(self.dst))
-        self.assertEqual(os.path.realpath(self.dst), os.path.realpath(self.src))
+        self.assertTrue(self.linked())
+        self.assertTrue(os.path.samefile(self.dst, self.src))
         self.assertTrue(os.path.exists(self.dst + ".verified"))
         again = self.gather(link=True)  # a re-run keeps the verified link
         self.assertEqual(len(again["kept"]), 1)
-        self.assertTrue(os.path.islink(self.dst))
+        self.assertTrue(self.linked())
 
     def test_copy(self):
         s = self.gather(link=False)
@@ -71,7 +79,10 @@ class ExistingModelsTest(unittest.TestCase):
 
     def test_link_replaces_dangling_link(self):
         os.makedirs(os.path.dirname(self.dst))
-        os.symlink(os.path.join(self.tmp.name, "gone.safetensors"), self.dst)
+        try:
+            os.symlink(os.path.join(self.tmp.name, "gone.safetensors"), self.dst)
+        except OSError:
+            self.skipTest("this Windows user may not make symlinks (no Developer Mode)")
         self.gather(link=True)
         self.assertEqual(os.path.realpath(self.dst), os.path.realpath(self.src))
 
@@ -103,8 +114,8 @@ class Fp16CopyTest(unittest.TestCase):
 
         self.mock = mock
         self.tmp = tempfile.TemporaryDirectory()
-        self.home = os.environ.get("HOME")
-        os.environ["HOME"] = self.tmp.name
+        self.home = os.environ.get(HOME_VAR)
+        os.environ[HOME_VAR] = self.tmp.name
         self.models = os.path.join(self.tmp.name, "models")
         self.src = os.path.join(self.models, "diffusion_models", "t-bf16.safetensors")
         self.dst = self.src.replace("-bf16", "-fp16")
@@ -122,7 +133,7 @@ class Fp16CopyTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         if self.home is not None:
-            os.environ["HOME"] = self.home
+            os.environ[HOME_VAR] = self.home
         self.tmp.cleanup()
 
     def fake_run(self, cmd, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003

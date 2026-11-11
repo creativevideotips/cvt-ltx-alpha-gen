@@ -9,6 +9,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from ltxag_worker import log as ltxlog  # noqa: E402
 
+# Windows port: the variable that names the user's folder (where ~ points, so the config, cache
+# and log of a test stay out of the real ones).
+HOME_VAR = "USERPROFILE" if sys.platform == "win32" else "HOME"
+
 # Must match ofx/src/log.cpp exactly (one shared timeline).
 LINE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} (DEBUG|INFO |WARN |ERROR) "
                   r"job\[\d+/\d+\] node=n1 job=j1 \| (.*)$")
@@ -17,7 +21,7 @@ LINE = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} (DEBUG|INFO |WARN |ER
 class LogTest(unittest.TestCase):
     def test_format_and_level(self):
         with tempfile.TemporaryDirectory() as home, \
-                mock.patch.dict(os.environ, {"HOME": home, "LTXAG_LOG_LEVEL": "info"}):
+                mock.patch.dict(os.environ, {HOME_VAR: home, "LTXAG_LOG_LEVEL": "info"}):
             lg = ltxlog.Logger("job", node="n1", job="j1")
             lg.info("hello")
             lg.debug("hidden")
@@ -31,7 +35,8 @@ class LogTest(unittest.TestCase):
         self.assertEqual((m1.group(1), m1.group(2)), ("ERROR", "bad thing"))
 
     def test_never_raises(self):
-        with mock.patch.dict(os.environ, {"HOME": "/nonexistent/forbidden"}):
+        nowhere = "Q:\\nonexistent\\forbidden" if sys.platform == "win32" else "/nonexistent/forbidden"
+        with mock.patch.dict(os.environ, {HOME_VAR: nowhere}):
             ltxlog.Logger("job").error("no crash")
 
 
