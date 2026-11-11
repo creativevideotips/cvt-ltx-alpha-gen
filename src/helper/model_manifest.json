@@ -13,6 +13,11 @@
       "url": "https://github.com/astral-sh/uv/releases/download/0.12.18/uv-aarch64-apple-darwin.tar.gz",
       "size": 16963768,
       "sha256": "cf40e0c6a202190ccd9e0406dcfdd5b2d6668a9a5c779b17948963df32aafe5b"
+    },
+    "win32": {
+      "url": "https://github.com/astral-sh/uv/releases/download/0.12.18/uv-x86_64-pc-windows-msvc.zip",
+      "size": 17891221,
+      "sha256": "cae6a3bc25239f83dffb467a4b180508d9da23986c04639ebfa44e43e6a84bff"
     }
   },
   "ltx2": {
@@ -28,6 +33,7 @@
     "note": "uv cache size after a fresh uv sync of ltx2-uv.lock (measured 6627332375 bytes incl. pip_extra, Rocky 9.7, 2026-10-11); only drives the setup progress bar",
     "uv_cache_bytes": 6600000000,
     "uv_cache_bytes_darwin": 1400000000,
+    "uv_cache_bytes_win32": 4500000000,
     "python": "3.14.7",
     "python_note": "uv-managed Python used for the runtime (uv sync --managed-python --python); the version every test ran on"
   },

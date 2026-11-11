@@ -1,12 +1,15 @@
 #include "transport.h"
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cerrno>
 #include <cstring>
 
+#include "oscompat.h"
 #include "platform.h"
 
 namespace ltxag {

@@ -3,7 +3,12 @@
 // Signatures follow the vendored headers in third_party/openfx/include.
 #include "ofx_host.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 #include <cmath>
 #include <cstdarg>
@@ -574,6 +579,17 @@ Host::Host(const std::string& binaryPath) : main_(std::this_thread::get_id()) {
   ofxHost.host = H(&hostProps);
   ofxHost.fetchSuite = fetchSuite;
 
+#ifdef _WIN32
+  // Windows port: LoadLibrary, as a Windows host loads the .ofx.
+  const HMODULE mod = LoadLibraryA(binaryPath.c_str());
+  lib_ = mod;
+  if (!lib_) {
+    error_ = "LoadLibrary: error " + std::to_string(GetLastError());
+    return;
+  }
+  auto count = reinterpret_cast<int (*)()>(reinterpret_cast<void*>(GetProcAddress(mod, "OfxGetNumberOfPlugins")));
+  auto get = reinterpret_cast<OfxPlugin* (*)(int)>(reinterpret_cast<void*>(GetProcAddress(mod, "OfxGetPlugin")));
+#else
   lib_ = dlopen(binaryPath.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!lib_) {
     error_ = std::string("dlopen: ") + dlerror();
@@ -581,6 +597,7 @@ Host::Host(const std::string& binaryPath) : main_(std::this_thread::get_id()) {
   }
   auto count = reinterpret_cast<int (*)()>(dlsym(lib_, "OfxGetNumberOfPlugins"));
   auto get = reinterpret_cast<OfxPlugin* (*)(int)>(dlsym(lib_, "OfxGetPlugin"));
+#endif
   if (!count || !get || count() < 1) {
     error_ = "OFX entry points missing or no plugin";
     return;

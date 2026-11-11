@@ -18,8 +18,9 @@ two mattes towards each other first (ltxag_worker/morph.py).
 Status file <cache_root>/jobs/<job_id>.json is rewritten after every chunk (state "running")
 and at the end, so the plugin can follow progress.
 Real worker (manifest has worker_python): talks to the RESIDENT worker server over a Unix socket
-(ltx_worker.py --serve; decisions 11/19/33/55), starting it if none is running. Extra manifest
-fields: worker_socket, unload, flame_pid, colour ("Auto"|"Bypass"), colour_tag (the colourspace the
+(ltx_worker.py --serve; decisions 11/19/33/55; Windows: a loopback port, oslayer.listen), starting
+it if none is running. Extra manifest fields: worker_socket, unload, offload (Windows port: where
+the worker keeps the model's weights, "none" | "cpu" | "disk"; absent = "none"), flame_pid, colour ("Auto"|"Bypass"), colour_tag (the colourspace the
 host delivered; absent = ""), ocio_config, seed. holds[] (one per chunk, decisions
 74/75): the Frame Hold the worker applies; the progress weights chunks by model frames. Dummy worker: one subprocess
 per job, as before.
@@ -34,11 +35,9 @@ VRAM log (decision 56): the manifest's "vram" (the plugin's preflight numbers) p
 from __future__ import annotations
 
 import csv
-import fcntl
 import json
 import os
 import queue
-import signal
 import socket
 import subprocess
 import sys
@@ -255,7 +254,7 @@ def save_timing(new: dict | None) -> None:
         tmp = TIMING_PATH + f".tmp{os.getpid()}"
         with open(tmp, "w") as f:
             json.dump(merged, f)
-        os.replace(tmp, TIMING_PATH)
+        oslayer.replace(tmp, TIMING_PATH)
         log.info(f"timing: {merged['rate']:.4f} s per step per Mpx-frame, pre {merged['pre']:.1f} / "
                  f"post {merged['post']:.1f} steps ({merged['jobs']} job(s))")
     except OSError as exc:
@@ -324,7 +323,7 @@ def signal_refresh(job_id: str, node_id: str, state: str) -> None:
         tmp = os.path.join(REFRESH_DIR, f".{job_id}.tmp")
         with open(tmp, "w") as f:
             json.dump({"job_id": job_id, "node_id": node_id, "state": state, "time": time.time()}, f)
-        os.replace(tmp, os.path.join(REFRESH_DIR, f"{job_id}.json"))
+        oslayer.replace(tmp, os.path.join(REFRESH_DIR, f"{job_id}.json"))
     except OSError as exc:
         log.warn(f"could not write the refresh marker: {exc}")
 
@@ -338,7 +337,7 @@ class SubprocessChannel:
     def __init__(self, cmd: list[str]) -> None:
         log.info("worker command: " + " ".join(cmd))
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                                     stderr=subprocess.STDOUT, text=True, **oslayer.NEW_SESSION)
         log.info(f"worker pid {self.proc.pid}")
         self.lines: queue.Queue = queue.Queue()
 
@@ -350,10 +349,12 @@ class SubprocessChannel:
         threading.Thread(target=pump, daemon=True).start()
 
     def kill(self) -> None:
-        os.killpg(self.proc.pid, signal.SIGKILL)
+        oslayer.kill_tree(self.proc.pid)
 
     def finish(self) -> str:
         status = self.proc.wait()
+        if oslayer.WINDOWS:  # no signals there: an exit code the worker itself never returns (0, 2, 3)
+            return f"worker crashed (exit code {status})" if status not in (0, 2, 3) else ""
         return f"worker crashed (signal {-status})" if status < 0 else ""
 
     def exit_text(self) -> str:
@@ -361,13 +362,7 @@ class SubprocessChannel:
 
 
 def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+    return oslayer.pid_alive(pid)
 
 
 class ResidentChannel:
@@ -385,9 +380,10 @@ class ResidentChannel:
             conn = self._connect()
             f = conn.makefile("rb")
             try:
-                conn.sendall((json.dumps(request) + "\n").encode())
+                # Windows: the worker's secret from its info file (oslayer.listen); "" on the Mac.
+                conn.sendall((json.dumps(dict(request, secret=self._info().get("secret", ""))) + "\n").encode())
                 first = f.readline().decode().rstrip("\n")
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 first = ""  # the worker went away: as below
             if first in ("restart", ""):
                 # cvt1.33: "" = the worker unloaded after another job while this one waited for it
@@ -405,8 +401,11 @@ class ResidentChannel:
             self.lines.put(first)
 
             def pump():
-                for raw in f:
-                    self.lines.put(raw.decode().rstrip("\n"))
+                try:
+                    for raw in f:
+                        self.lines.put(raw.decode().rstrip("\n"))
+                except OSError:  # Windows: a worker that was killed resets the connection
+                    pass
                 self.lines.put(EOF_LINE)
 
             self.conn = conn
@@ -424,7 +423,7 @@ class ResidentChannel:
     def _ensure_server(self) -> None:
         os.makedirs(os.path.dirname(self.sock_path), exist_ok=True)
         with open(self.sock_path + ".lock", "w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)  # one starter at a time (two Process presses)
+            oslayer.lock_file(lock)  # one starter at a time (two Process presses)
             info = self._info()
             if info.get("pid") and pid_alive(info["pid"]) and info.get("state") in ("loading", "ready", "busy"):
                 self.server_pid = info["pid"]
@@ -437,13 +436,25 @@ class ResidentChannel:
                    *m.get("worker_args", [])]
             if self.request.get("unload", True):
                 cmd.append("--rebuild-transformer")  # decision 55: lower peak when not resident
+            if self.request.get("offload", "none") != "none":  # Windows port: weights off the GPU
+                cmd += ["--offload", self.request["offload"]]
+            if oslayer.WINDOWS:  # paths and the log as UTF-8, whatever the PC's code page
+                cmd[1:1] = ["-X", "utf8"]
             out = open(os.path.join(os.path.dirname(self.sock_path), "worker.out"), "w")
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                                    start_new_session=True)  # outlives this job when resident
+                                    **oslayer.NEW_SESSION)  # outlives this job when resident
             self.server_pid, self.proc = proc.pid, proc
             log.info(f"started resident worker pid {proc.pid}: " + " ".join(cmd))
             deadline = time.time() + 120
-            while time.time() < deadline and self._info().get("pid") != proc.pid:
+            started = time.time() - 1.0
+
+            def announced() -> bool:
+                # Windows port: a venv's python.exe is a launcher there, so the worker itself has
+                # another pid than the one started: an info file written since then is its own.
+                info = self._info()
+                return info.get("pid") == proc.pid or (oslayer.WINDOWS and info.get("time", 0) >= started)
+
+            while time.time() < deadline and not announced():
                 if proc.poll() is not None:
                     raise RuntimeError(f"worker exited at start (exit {proc.returncode}); see worker.out")
                 time.sleep(0.2)
@@ -463,11 +474,8 @@ class ResidentChannel:
             elif info.get("state") == "loading":
                 self.tracker.note("Loading the model")
             try:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.connect(self.sock_path)
-                return s
+                return oslayer.connect(self.sock_path, info)
             except (FileNotFoundError, ConnectionRefusedError):
-                s.close()
                 time.sleep(0.3)
         raise RuntimeError("timed out waiting for the resident worker")
 
@@ -485,7 +493,7 @@ class ResidentChannel:
         t0 = time.time()
         for attempt in (1, 2):
             try:
-                os.killpg(self.server_pid, signal.SIGKILL)
+                oslayer.kill_tree(self.server_pid)
             except ProcessLookupError:
                 pass
             while self._server_alive() and time.time() - t0 < 10 * attempt:
@@ -520,7 +528,7 @@ class ResidentChannel:
 def main() -> int:
     manifest_path = sys.argv[1]
     ui = "--no-ui" not in sys.argv
-    with open(manifest_path) as f:
+    with open(manifest_path, encoding="utf-8") as f:
         m = json.load(f)
     job_id, root = m["job_id"], m["cache_root"]
     log.node, log.job = m.get("node_id", "-"), job_id
@@ -563,11 +571,12 @@ def main() -> int:
                        "chunks": chunks, "out_prefix": out_prefix, "colour": m.get("colour", "Bypass"),
                        "colour_tag": m.get("colour_tag", ""), "ocio_config": m.get("ocio_config", ""), "precision": m["precision"],
                        "model_dir": m["model_dir"], "unload": bool(m.get("unload", True)),
+                       "offload": m.get("offload", "none"),
                        "seed": int(m.get("seed", 1234)), "holds": holds}
             channel = ResidentChannel(m, request, progress, tracker)
         else:
             channel = SubprocessChannel(
-                [sys.executable, "-I", "-B", m["worker"], "--in", m["input"],
+                [sys.executable, "-I", "-B", *(["-X", "utf8"] if oslayer.WINDOWS else []), m["worker"], "--in", m["input"],
                  "--chunks", ",".join(f"{s}:{n}" for s, n in chunks), "--out-prefix", out_prefix,
                  "--seconds", str(m["seconds"]), "--simulate", m["simulate"], "--precision", m["precision"]])
     except KeyboardInterrupt:
@@ -648,7 +657,7 @@ def main() -> int:
             s, n = chunks[i]
             results[i] = np.fromfile(f"{out_prefix}_{i}.bin", dtype="<f2",
                                      offset=transport.HEADER.size).reshape(n, m["height"], m["width"])
-            os.unlink(f"{out_prefix}_{i}.bin")
+            oslayer.remove(f"{out_prefix}_{i}.bin")
             for f in range(s, s + n):
                 finalize(f)
             for j in list(results):
@@ -689,10 +698,7 @@ def main() -> int:
     cache.write_status(root, job_id, state, message, chunks_done=len(chunks) if state == "done" else -1,
                        chunks=len(chunks), frames_done=len(finished), frames=len(keys))
     for p in [m["input"], manifest_path, pid_file] + [f"{out_prefix}_{i}.bin" for i in range(len(chunks))]:
-        try:
-            os.unlink(p)
-        except FileNotFoundError:
-            pass
+        oslayer.remove(p)
     if started_by_flame(m.get("flame_pid", 0)):
         signal_refresh(job_id, m.get("node_id", "-"), state)
     summary = (f"end: {state} {message} ({len(finished)}/{len(keys)} frames cached, "

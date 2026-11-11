@@ -6,7 +6,15 @@
 // must not leak into our Python.
 #pragma once
 
+#ifdef _WIN32
+// Windows port: the C runtime has a process.h of its own, which <thread> includes, and this
+// folder comes first on the include path: so this file passes the runtime's one on.
+#include <../ucrt/process.h>
+
+#include "win_compat.h"  // pid_t
+#else
 #include <sys/types.h>
+#endif
 
 #include <string>
 #include <vector>
@@ -31,8 +39,17 @@ class WorkerProcess {
 
  private:
   pid_t pid_ = -1;
+#ifdef _WIN32
+  // Windows port (process_win.cpp): handles. The worker and everything it starts are in a job
+  // object, which kill() ends; wait() returns the exit code.
+  void* process_ = nullptr;
+  void* job_ = nullptr;
+  void* outRead_ = nullptr;
+  void* inWrite_ = nullptr;
+#else
   int outFd_ = -1;
   int inFd_ = -1;
+#endif
   std::string buf_;
 };
 

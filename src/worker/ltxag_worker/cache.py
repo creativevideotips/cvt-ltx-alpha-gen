@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 
-from . import transport
+from . import oslayer, transport
 
 
 def matte_path(root: str, key: str) -> str:
@@ -29,7 +29,7 @@ def write_matte(root: str, key: str, matte: np.ndarray) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.tmp{os.getpid()}"
     transport.write_mattes(tmp, matte[np.newaxis])
-    os.replace(tmp, path)
+    oslayer.replace(tmp, path)
 
 
 def mark_pending(root: str, keys: list[str], pid: int) -> None:
@@ -41,10 +41,7 @@ def mark_pending(root: str, keys: list[str], pid: int) -> None:
 
 def clear_pending(root: str, keys) -> None:
     for k in keys:
-        try:
-            os.unlink(pending_path(root, k))
-        except FileNotFoundError:
-            pass
+        oslayer.remove(pending_path(root, k))
 
 
 def write_status(root: str, job_id: str, state: str, message: str = "", **progress) -> None:
@@ -55,4 +52,4 @@ def write_status(root: str, job_id: str, state: str, message: str = "", **progre
     tmp = os.path.join(d, f".{job_id}.tmp")
     with open(tmp, "w") as f:
         json.dump({"state": state, "message": message, "time": time.time(), **progress}, f)
-    os.replace(tmp, os.path.join(d, job_id + ".json"))
+    oslayer.replace(tmp, os.path.join(d, job_id + ".json"))

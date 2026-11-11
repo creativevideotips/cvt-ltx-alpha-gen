@@ -70,6 +70,8 @@ def main() -> int:
         say("error", "oom", "GPU out of memory (simulated)")  # cvt1.10: was "CUDA" (Mac only now)
         return 2
     if args.simulate == "crash":
+        if sys.platform == "win32":  # no signals: end at once with the code a segfault would show
+            os._exit(signal.SIGSEGV)
         os.kill(os.getpid(), signal.SIGSEGV)
     if args.simulate == "hang":
         while True:

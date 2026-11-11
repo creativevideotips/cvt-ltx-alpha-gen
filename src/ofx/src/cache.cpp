@@ -1,10 +1,12 @@
 #include "cache.h"
 
+#ifndef _WIN32
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -15,6 +17,7 @@
 #include <ctime>
 #include <fstream>
 
+#include "oscompat.h"
 #include "platform.h"
 #include "transport.h"
 
@@ -37,6 +40,21 @@ bool endsWith(const std::string& s, const std::string& suffix) {
   return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+// Makes a folder with every level above it. The cache folder may not be there at a Process (it
+// was deleted, or a new Cache Folder was typed in): without it the thumbnails and the pending
+// markers could not be written, and that Process ended in MATTE MISSING (found on Windows, where
+// a first Process in a dev build ran before any Setup had made the folder).
+void makeDirs(const std::string& dir) {
+#ifdef _WIN32
+  const char* const separators = "/\\";
+#else
+  const char* const separators = "/";
+#endif
+  for (size_t pos = 1; (pos = dir.find_first_of(separators, pos)) != std::string::npos; ++pos)
+    mkdir(dir.substr(0, pos).c_str(), 0755);
+  mkdir(dir.c_str(), 0755);
+}
+
 // cvt1.18: deleting a matte also deletes its thumbnail (<key>.thumb beside <key>.matte).
 void unlinkThumbOf(const std::string& mattePathStr) {
   if (endsWith(mattePathStr, ".matte"))
@@ -44,7 +62,7 @@ void unlinkThumbOf(const std::string& mattePathStr) {
 }
 
 int readPid(const std::string& path) {
-  std::ifstream in(path);
+  std::ifstream in(fsPath(path));
   int pid = 0;
   in >> pid;
   return pid;
@@ -52,13 +70,15 @@ int readPid(const std::string& path) {
 
 }  // namespace
 
+#ifdef _WIN32
+bool pidAlive(int pid) { return processAlive(pid); }
+#else
 bool pidAlive(int pid) { return pid > 0 && (kill(pid, 0) == 0 || errno == EPERM); }
+#endif
 
 CacheSettings cacheSettings(const UserConfig& cfg) {
   CacheSettings s;
-  const char* home = std::getenv("HOME");
-  s.root = cfg.count("cache_dir") ? cfg.at("cache_dir")
-                                  : std::string(home ? home : "/tmp") + "/.cache/ltx-alphagen/mattes";
+  s.root = cfg.count("cache_dir") ? cfg.at("cache_dir") : homeDirectory() + "/.cache/ltx-alphagen/mattes";
   if (cfg.count("cache_max_days")) s.maxAgeDays = std::atoi(cfg.at("cache_max_days").c_str());
   if (cfg.count("cache_cap_gb")) s.capGB = std::atof(cfg.at("cache_cap_gb").c_str());
   return s;
@@ -100,9 +120,9 @@ std::string thumbPath(const std::string& root, const std::string& key) {
 
 bool writeThumb(const std::string& root, const std::string& key, const std::vector<float>& thumb) {
   if (thumb.size() != size_t(kThumbW) * kThumbH * kThumbC) return false;
-  mkdir((root + "/" + key.substr(0, 2)).c_str(), 0755);
+  makeDirs(root + "/" + key.substr(0, 2));
   const std::string path = thumbPath(root, key), tmp = path + ".tmp" + std::to_string(getpid());
-  std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+  std::ofstream f(fsPath(tmp), std::ios::binary | std::ios::trunc);
   const uint32_t head[5] = {0x5458544Cu /* "LTXT" */, 1u, uint32_t(kThumbW), uint32_t(kThumbH), uint32_t(kThumbC)};
   f.write(reinterpret_cast<const char*>(head), sizeof head);
   f.write(reinterpret_cast<const char*>(thumb.data()), std::streamsize(thumb.size() * sizeof(float)));
@@ -112,11 +132,11 @@ bool writeThumb(const std::string& root, const std::string& key, const std::vect
     return false;
   }
   chmod(tmp.c_str(), 0644);  // cvt1.43: written inside Resolve, whose umask is 000
-  return rename(tmp.c_str(), path.c_str()) == 0;  // atomic: a render never reads half a thumbnail
+  return renameOver(tmp.c_str(), path.c_str()) == 0;  // atomic: a render never reads half a thumbnail
 }
 
 bool readThumb(const std::string& root, const std::string& key, std::vector<float>& thumb) {
-  std::ifstream f(thumbPath(root, key), std::ios::binary);
+  std::ifstream f(fsPath(thumbPath(root, key)), std::ios::binary);
   uint32_t head[5] = {0, 0, 0, 0, 0};
   if (!f.read(reinterpret_cast<char*>(head), sizeof head)) return false;
   if (head[0] != 0x5458544Cu || head[1] != 1u || head[2] != uint32_t(kThumbW) || head[3] != uint32_t(kThumbH) ||
@@ -185,7 +205,7 @@ bool isPending(const std::string& root, const std::string& key) {
 }
 
 void markPending(const std::string& root, const std::vector<std::string>& keys, int pid) {
-  mkdir((root + "/pending").c_str(), 0755);
+  makeDirs(root + "/pending");
   const std::string text = std::to_string(pid);
   for (const auto& k : keys) {
     const int fd = open(pendingPath(root, k).c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);

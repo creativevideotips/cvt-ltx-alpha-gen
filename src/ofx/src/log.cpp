@@ -1,5 +1,9 @@
 #include "log.h"
 
+#if defined(_WIN32)
+// Windows port: the POSIX calls below come from win_compat.h (through oscompat.h).
+extern "C" __declspec(dllimport) unsigned long __stdcall GetCurrentThreadId();
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #if defined(__APPLE__)
@@ -8,6 +12,7 @@
 #include <sys/syscall.h>
 #endif
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -19,6 +24,7 @@
 #include <cstring>
 #include <ctime>
 
+#include "oscompat.h"
 #include "user_config.h"
 
 namespace ltxag {
@@ -49,7 +55,9 @@ bool parseLevel(const std::string& s, LogLevel& out) {
 // The OS thread id, as Python's threading.get_native_id() reports it. macOS: SYS_gettid is a
 // different call there (per-thread credentials), so pthread_threadid_np (pthread.h).
 long threadId() {
-#if defined(__APPLE__)
+#if defined(_WIN32)
+  return long(GetCurrentThreadId());
+#elif defined(__APPLE__)
   uint64_t tid = 0;
   pthread_threadid_np(nullptr, &tid);
   return long(tid);
@@ -60,8 +68,7 @@ long threadId() {
 }  // namespace
 
 std::string logDir() {
-  const char* home = std::getenv("HOME");
-  return std::string(home ? home : "/tmp") + "/.cache/ltx-alphagen/logs";
+  return homeDirectory() + "/.cache/ltx-alphagen/logs";
 }
 
 std::string logPath() { return logDir() + "/ltx-alphagen.log"; }
@@ -84,10 +91,10 @@ void rotateLogs(size_t maxBytes, int keep) {
   struct stat st {};
   const std::string base = logPath();
   if (stat(base.c_str(), &st) != 0 || size_t(st.st_size) < maxBytes) return;
-  std::remove((base + "." + std::to_string(keep)).c_str());
+  unlink((base + "." + std::to_string(keep)).c_str());
   for (int i = keep - 1; i >= 1; --i)
-    std::rename((base + "." + std::to_string(i)).c_str(), (base + "." + std::to_string(i + 1)).c_str());
-  std::rename(base.c_str(), (base + ".1").c_str());
+    renameOver((base + "." + std::to_string(i)).c_str(), (base + "." + std::to_string(i + 1)).c_str());
+  renameOver(base.c_str(), (base + ".1").c_str());
 }
 
 void logAt(LogLevel level, const char* fmt, ...) {

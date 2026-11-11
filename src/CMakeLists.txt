@@ -5,6 +5,9 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version")
 project(LTXAlphaGenOFX LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 14)  # OFX 1.4 Support uses throw() specs and auto_ptr
+# Windows port: the C++ runtime is linked into the .ofx and the helper, so they need no Visual
+# C++ redistributable on the user's PC. Ignored by other compilers.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT CMAKE_BUILD_TYPE)
@@ -54,18 +57,53 @@ add_library(ofx_support STATIC
   ${OFX_DIR}/Support/Library/ofxsProperty.cpp
   ${OFX_DIR}/Support/Library/ofxsPropertyValidation.cpp)
 target_include_directories(ofx_support PUBLIC ${OFX_DIR}/include ${OFX_DIR}/Support/include)
-target_compile_options(ofx_support PRIVATE -w -fvisibility=hidden)
+if(MSVC)
+  target_compile_options(ofx_support PRIVATE /w /EHsc)
+  target_compile_definitions(ofx_support PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+else()
+  target_compile_options(ofx_support PRIVATE -w -fvisibility=hidden)
+endif()
 
 # OS-specific sources behind ofx/src/platform.h (decision 64), the libraries they need, and the
 # bundle's binary folder (OFX: Linux-x86-64; MacOS, as the installed Mac plugins use).
 # CVT Resolve port: macOS on Apple Silicon only (the Linux/NVIDIA layer was removed).
+# Windows port: Windows x64 with an NVIDIA card as well (CUDA, as upstream's Linux build). There
+# win_compat.cpp supplies the POSIX calls the shared sources use, and process_win.cpp replaces
+# process.cpp. LTXAG_OS_SOURCES is what a target needs when it has no platform layer.
+set(LTXAG_PROCESS_SOURCE ofx/src/process.cpp)
+set(LTXAG_OS_SOURCES "")
+set(LTXAG_THREAD_LIB pthread)
+set(LTXAG_DL_LIB dl)
 if(APPLE)
   enable_language(OBJCXX)
   set(LTXAG_PLATFORM_SOURCES ofx/src/platform_macos.cpp ofx/src/platform_macos_metal.mm)
   set(LTXAG_PLATFORM_LIBS "-framework Metal" "-framework Foundation")
   set(LTXAG_ARCH_DIR MacOS)
+elseif(WIN32)
+  if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "Build for x64 (cmake -A x64): DaVinci Resolve and Fusion Studio are 64-bit")
+  endif()
+  set(LTXAG_OS_SOURCES ofx/src/win_compat.cpp)
+  set(LTXAG_PROCESS_SOURCE ofx/src/process_win.cpp)
+  set(LTXAG_PLATFORM_SOURCES ofx/src/platform_win.cpp ofx/src/win_compat.cpp)
+  set(LTXAG_PLATFORM_LIBS shell32 advapi32)
+  set(LTXAG_ARCH_DIR Win64)  # the OFX name for 64-bit Windows binaries
+  set(LTXAG_THREAD_LIB "")
+  set(LTXAG_DL_LIB "")
+  # _CRT_DECLARE_NONSTDC_NAMES=0: the C runtime does not declare its own unlink, mkdir, stat, open
+  # ... (ANSI code page paths); win_compat.h declares UTF-8 ones under those names.
+  add_compile_definitions(_CRT_DECLARE_NONSTDC_NAMES=0 _CRT_SECURE_NO_WARNINGS NOMINMAX UNICODE _UNICODE)
+  if(MSVC)
+    add_compile_options(/utf-8 /EHsc)
+  endif()
 else()
-  message(FATAL_ERROR "This port builds on macOS (Apple Silicon) only")
+  message(FATAL_ERROR "This port builds on macOS (Apple Silicon) and Windows (x64) only")
+endif()
+# What the compiler warns about in our own sources (not the vendored OpenFX library).
+if(MSVC)
+  set(LTXAG_WARNINGS /W3)
+else()
+  set(LTXAG_WARNINGS -Wall -Wextra -Wno-deprecated-declarations -Wno-deprecated -fvisibility=hidden)
 endif()
 
 # Pure logic, shared with the unit tests.
@@ -78,19 +116,18 @@ add_library(${BUNDLE_NAME} MODULE
   ofx/src/user_config.cpp
   ${LTXAG_PLATFORM_SOURCES}
   ofx/src/transport.cpp
-  ofx/src/process.cpp
+  ${LTXAG_PROCESS_SOURCE}
   ofx/src/cache.cpp
   ofx/src/marker.cpp
   ofx/src/env_info.cpp)
-target_link_libraries(${BUNDLE_NAME} PRIVATE ofx_support ltxag_core ${LTXAG_PLATFORM_LIBS} pthread)
+target_link_libraries(${BUNDLE_NAME} PRIVATE ofx_support ltxag_core ${LTXAG_PLATFORM_LIBS} ${LTXAG_THREAD_LIB})
 # ofxsSupportPrivate.h: the raw property suite and the instance lookup for the OpenFX 1.5 colour
 # request, which the 1.4 Support library does not know (Input Colour Auto).
 target_include_directories(${BUNDLE_NAME} PRIVATE ${OFX_DIR}/Support/Library)
 target_compile_definitions(${BUNDLE_NAME} PRIVATE LTXAG_DEV_BUILD=$<BOOL:${LTXAG_DEV_BUILD}>
   LTXAG_VERSION="${LTXAG_VERSION}" LTXAG_GIT="${LTXAG_GIT}"
   LTXAG_VERSION_MAJOR=${LTXAG_VERSION_MAJOR} LTXAG_VERSION_MINOR=${LTXAG_VERSION_MINOR})
-target_compile_options(${BUNDLE_NAME} PRIVATE -Wall -Wextra -Wno-deprecated-declarations -Wno-deprecated
-  -fvisibility=hidden)
+target_compile_options(${BUNDLE_NAME} PRIVATE ${LTXAG_WARNINGS})
 # Export only the two OFX entry points. libstdc++ is linked dynamically: Flame
 # 2027.1 itself (and Sapphire) use the system /lib64/libstdc++.so.6 (GCC 11),
 # so building with Rocky 9's system GCC 11 matches the host exactly.
@@ -117,6 +154,27 @@ endif()
 set_target_properties(${BUNDLE_NAME} PROPERTIES
   PREFIX "" SUFFIX ".ofx"
   LIBRARY_OUTPUT_DIRECTORY ${BUNDLE_DIR}/Contents/${LTXAG_ARCH_DIR})
+if(WIN32)
+  # Windows port: the two OFX entry points are exported by OfxExport (__declspec(dllexport),
+  # ofxCore.h). Visual Studio builds each configuration in its own subfolder unless told the
+  # folder per configuration: the bundle has one. The import library stays out of the bundle.
+  foreach(cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set_target_properties(${BUNDLE_NAME} PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY_${cfg} ${BUNDLE_DIR}/Contents/${LTXAG_ARCH_DIR}
+      ARCHIVE_OUTPUT_DIRECTORY_${cfg} ${CMAKE_BINARY_DIR}/lib)
+  endforeach()
+  # ltxag_ui.exe: the progress window, message boxes and folder picker (ofx/ui/ltxag_ui.cpp),
+  # beside the .ofx. What mac_progress.swift and osascript are on the Mac, built here instead of
+  # on the user's PC.
+  add_executable(ltxag_ui WIN32 ofx/ui/ltxag_ui.cpp)
+  target_link_libraries(ltxag_ui PRIVATE user32 gdi32 comctl32 ole32 shell32 uuid)
+  target_compile_options(ltxag_ui PRIVATE ${LTXAG_WARNINGS})
+  foreach(cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set_target_properties(ltxag_ui PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY_${cfg} ${BUNDLE_DIR}/Contents/${LTXAG_ARCH_DIR})
+  endforeach()
+  add_dependencies(${BUNDLE_NAME} ltxag_ui)
+endif()
 
 # Python worker and Model Page helper go into the bundle's Resources
 # (refreshed on every build, not only when the .ofx relinks).
@@ -139,7 +197,11 @@ add_custom_target(bundle_resources ALL
 enable_testing()
 # Python used by the worker tests; needs numpy importable in isolated mode (-I),
 # exactly as the plugin launches it. On Rocky 9 /usr/bin/python3 qualifies.
-set(WORKER_TEST_PYTHON /usr/bin/python3 CACHE FILEPATH "Python for worker tests")
+if(WIN32)
+  set(WORKER_TEST_PYTHON python CACHE FILEPATH "Python for worker tests")
+else()
+  set(WORKER_TEST_PYTHON /usr/bin/python3 CACHE FILEPATH "Python for worker tests")
+endif()
 add_executable(test_chunk_plan ofx/tests/test_chunk_plan.cpp)
 target_link_libraries(test_chunk_plan PRIVATE ltxag_core)
 add_test(NAME chunk_plan COMMAND test_chunk_plan)
@@ -147,7 +209,7 @@ add_test(NAME worker_python
   COMMAND ${WORKER_TEST_PYTHON} -B -m unittest discover -s ${CMAKE_SOURCE_DIR}/worker/tests)
 
 add_executable(test_worker_roundtrip ofx/tests/test_worker_roundtrip.cpp ofx/src/transport.cpp
-  ofx/src/process.cpp ${LTXAG_PLATFORM_SOURCES})
+  ${LTXAG_PROCESS_SOURCE} ${LTXAG_PLATFORM_SOURCES})
 target_link_libraries(test_worker_roundtrip PRIVATE ${LTXAG_PLATFORM_LIBS})
 target_include_directories(test_worker_roundtrip PRIVATE ofx/src)
 add_dependencies(test_worker_roundtrip bundle_resources)
@@ -155,7 +217,7 @@ add_test(NAME worker_roundtrip
   COMMAND test_worker_roundtrip ${WORKER_TEST_PYTHON} ${BUNDLE_DIR}/Contents/Resources/worker/dummy_worker.py)
 
 add_executable(test_cache ofx/tests/test_cache.cpp ofx/src/cache.cpp ofx/src/transport.cpp
-  ofx/src/user_config.cpp ofx/src/process.cpp ${LTXAG_PLATFORM_SOURCES})
+  ofx/src/user_config.cpp ${LTXAG_PROCESS_SOURCE} ${LTXAG_PLATFORM_SOURCES})
 target_link_libraries(test_cache PRIVATE ${LTXAG_PLATFORM_LIBS})
 target_include_directories(test_cache PRIVATE ofx/src)
 add_test(NAME cache COMMAND test_cache)
@@ -165,7 +227,7 @@ target_link_libraries(test_roi PRIVATE ltxag_core)
 add_test(NAME roi COMMAND test_roi)
 
 add_executable(test_marker_log ofx/tests/test_marker_log.cpp ofx/src/marker.cpp ofx/src/log.cpp
-  ofx/src/user_config.cpp)
+  ofx/src/user_config.cpp ${LTXAG_OS_SOURCES})
 target_include_directories(test_marker_log PRIVATE ofx/src)
 add_test(NAME marker_log COMMAND test_marker_log)
 
@@ -179,15 +241,21 @@ add_test(NAME motion COMMAND test_motion)
 
 # System test host (systest/README.md): loads the bundle like Flame and runs end-to-end
 # scenarios. Not a ctest: it needs the isolated HOME and fake windows of systest/run_systest.sh.
-add_executable(ltxag_systest systest/host/systest.cpp systest/host/ofx_host.cpp ofx/src/process.cpp
+add_executable(ltxag_systest systest/host/systest.cpp systest/host/ofx_host.cpp ${LTXAG_PROCESS_SOURCE}
   ${LTXAG_PLATFORM_SOURCES})
 target_include_directories(ltxag_systest PRIVATE ofx/src systest/host ${OFX_DIR}/include)
-target_link_libraries(ltxag_systest PRIVATE ${LTXAG_PLATFORM_LIBS} pthread)
+target_link_libraries(ltxag_systest PRIVATE ${LTXAG_PLATFORM_LIBS} ${LTXAG_THREAD_LIB})
+if(WIN32)
+  # Windows port: the system test's stand-in for ltxag_ui.exe (what fake_ui.py is on the Mac):
+  # systest/run_systest.ps1 puts it in a copy of the bundle.
+  add_executable(ltxag_fake_ui systest/fake_ui.cpp)
+  add_dependencies(ltxag_systest ltxag_fake_ui)
+endif()
 add_dependencies(ltxag_systest ${BUNDLE_NAME} bundle_resources)
 
 add_executable(test_load_bundle ofx/tests/test_load_bundle.cpp)
 target_include_directories(test_load_bundle PRIVATE ${OFX_DIR}/include)
-target_link_libraries(test_load_bundle PRIVATE dl)
+target_link_libraries(test_load_bundle PRIVATE ${LTXAG_DL_LIB})
 add_dependencies(test_load_bundle ${BUNDLE_NAME})
 add_test(NAME load_bundle
   COMMAND test_load_bundle ${BUNDLE_DIR}/Contents/${LTXAG_ARCH_DIR}/${BUNDLE_NAME}.ofx)

@@ -8,10 +8,12 @@
 //                      --ltx-python <path> [--model-dir <dir>] [--job-python <path>]
 //                      [--job-timeout <s>] [--only <test>[,<test>...]]
 // It runs inside the HOME prepared by systest/run_systest.sh (isolated config, cache and logs).
+#ifndef _WIN32
 #include <dirent.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -30,6 +32,7 @@
 #include <vector>
 
 #include "ofx_host.h"
+#include "oscompat.h"
 #include "platform.h"
 
 using namespace systest;
@@ -38,8 +41,23 @@ namespace {
 
 // ---------------------------------------------------------------- options, results
 
+// Windows port: what differs by platform in the tests.
+#if defined(_WIN32)
+constexpr const char* kDefaultPython = "python.exe";
+constexpr const char* kPlatform = "windows";
+constexpr const char* kSupportSuffix = ".zip";
+#elif defined(__APPLE__)
+constexpr const char* kDefaultPython = "/usr/bin/python3";
+constexpr const char* kPlatform = "macos";
+constexpr const char* kSupportSuffix = ".tar.gz";
+#else
+constexpr const char* kDefaultPython = "/usr/bin/python3";
+constexpr const char* kPlatform = "linux";
+constexpr const char* kSupportSuffix = ".tar.gz";
+#endif
+
 struct Options {
-  std::string bundle, tier = "fast", out = ".", ltxPython, modelDir, jobPython = "/usr/bin/python3";
+  std::string bundle, tier = "fast", out = ".", ltxPython, modelDir, jobPython = kDefaultPython;
   std::string fp16;  // the real setup's transformer_fp16 ("" = not set; decision 68)
   double jobTimeout = 0;  // 0: tier default
   std::set<std::string> only;
@@ -84,7 +102,11 @@ void fail(const std::string& s) {
 bool contains(const std::string& s, const std::string& sub) { return s.find(sub) != std::string::npos; }
 bool startsWith(const std::string& s, const std::string& p) { return s.compare(0, p.size(), p) == 0; }
 
+#ifdef _WIN32
+std::string home() { return ltxag::homeDirectory(); }  // %USERPROFILE%, as the plugin and Python take it
+#else
 std::string home() { return std::getenv("HOME") ? std::getenv("HOME") : ""; }
+#endif
 std::string fakeUiDir() { return std::getenv("LTXAG_FAKE_UI_DIR") ? std::getenv("LTXAG_FAKE_UI_DIR") : ""; }
 
 std::string readFile(const std::string& p) {
@@ -141,7 +163,7 @@ void writeConfig(const std::map<std::string, std::string>& c) {
   const std::string dir = home() + "/.config/ltx-alphagen";
   mkdir((home() + "/.config").c_str(), 0755);
   mkdir(dir.c_str(), 0755);
-  std::ofstream out(configPath(), std::ios::trunc);
+  std::ofstream out(configPath(), std::ios::trunc | std::ios::binary);
   out << "# written by ltxag_systest\n";
   for (const auto& kv : c) out << kv.first << '=' << kv.second << '\n';
 }
@@ -907,7 +929,7 @@ void testMemoryWarning(Ctx& c) {
   in->defaultReply = Reply::None;
   j = runJob(*in, c.jobTimeout());
   CHECK(j.state == "none", "no answer: no job launched (" + j.state + ")");
-  CHECK(contains(in->getString("status"), "Too large for this Mac"), "no answer: Status says why: " + in->getString("status"));
+  CHECK(contains(in->getString("status"), "Too large for this "), "no answer: Status says why: " + in->getString("status"));
   // cvt1.27: Skip Memory Check runs it without asking, and the job is flagged as warned.
   in->setBool("skipMemoryCheck", true);
   const size_t m2 = in->messages.size();
@@ -982,6 +1004,10 @@ void testNoAppleTools(Ctx& c) {
 
 // cvt1.43: Resolve runs with umask 000, and nothing the plugin makes may end up writable by anyone.
 void testFilePermissions(Ctx& c) {
+#ifdef _WIN32
+  (void)c;
+  throw Skip("POSIX permission bits: Windows files take their folder's access list");
+#else
   c.readyConfig();
   Scene sc{320, 240, 9, AlphaMode::Opaque};
   auto in = c.node(sc);
@@ -1004,6 +1030,7 @@ void testFilePermissions(Ctx& c) {
     pclose(f);
   }
   CHECK(count == 0, std::to_string(count) + " writable by anyone:\n" + list);
+#endif
 }
 
 void testCollectLogs(Ctx& c) {
@@ -1015,8 +1042,9 @@ void testCollectLogs(Ctx& c) {
   const std::string t = in->messages.back().text;
   CHECK(contains(t, "Support bundle written to "), "message: " + t);
   const auto a = t.find(home() + "/ltx-alphagen-support-");
-  const auto b = t.find(".tar.gz", a);
-  CHECK(a != std::string::npos && b != std::string::npos && exists(t.substr(a, b + 7 - a)), "bundle file exists");
+  const auto b = t.find(kSupportSuffix, a);
+  CHECK(a != std::string::npos && b != std::string::npos && exists(t.substr(a, b + std::strlen(kSupportSuffix) - a)),
+        "bundle file exists");
   const std::string log = readFile(home() + "/.cache/ltx-alphagen/logs/ltx-alphagen.log");
   CHECK(contains(log, "==== plugin load (describe) ===="), "plugin log written in the isolated HOME");
   CHECK(contains(log, "job["), "job.py logged into the same file");
@@ -1041,7 +1069,11 @@ void testFullGate(Ctx& c) {
 bool workerAlive() {
   const std::string info = readFile(home() + "/.cache/ltx-alphagen/run/worker.sock.json");
   const int pid = std::atoi(jsonField(info, "pid").c_str());
+#ifdef _WIN32
+  return ltxag::processAlive(pid);
+#else
   return pid > 0 && kill(pid, 0) == 0;
+#endif
 }
 
 void testRealMatte(Ctx& c) {
@@ -1146,7 +1178,7 @@ std::string xmlEscape(const std::string& s) {
 }
 
 std::string bundleBinary(const std::string& bundle) {
-  for (const char* arch : {"MacOS", "Linux-x86-64"}) {
+  for (const char* arch : {"MacOS", "Win64", "Linux-x86-64"}) {
     const std::string p = bundle + "/Contents/" + arch + "/LTXAlphaGen.ofx";
     if (exists(p)) return p;
   }
@@ -1182,7 +1214,9 @@ int main(int argc, char** argv) {
                          "(LTXAG_FAKE_UI_DIR must be set: run it through systest/run_systest.sh)\n");
     return 2;
   }
+#ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
+#endif
   Ctx c;
   c.opt = o;
 #ifdef __APPLE__
@@ -1258,7 +1292,7 @@ int main(int argc, char** argv) {
 
   int failed = 0, skipped = 0;
   for (const auto& r : results) failed += !r.failures.empty(), skipped += !r.skipped.empty();
-  const std::string platform = c.mac ? "macos" : "linux";
+  const std::string platform = kPlatform;
   std::ofstream x(o.out + "/junit-" + o.tier + ".xml");
   x << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuite name=\"ltxag-systest-" << o.tier << "-" << platform
     << "\" tests=\"" << results.size() << "\" failures=\"" << failed << "\" skipped=\"" << skipped << "\" time=\""

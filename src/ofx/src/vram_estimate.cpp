@@ -23,9 +23,11 @@ constexpr double kMpsPerMpxFrame = 0.231;
 constexpr double kMps16Floor = 40.8;
 constexpr double kMps16Base = 37.0;
 constexpr double kMps16PerMpxFrame = 0.10;
+constexpr double kStreamBase = 6.0;  // Windows port: weights streamed to the GPU, see the header
 }  // namespace
 
-VramNeed estimateVramNeed(bool fp8, int width, int height, int frames, bool residentTransformer, int mps) {
+VramNeed estimateVramNeed(bool fp8, int width, int height, int frames, bool residentTransformer, int mps,
+                          bool streamed) {
   VramNeed n{};
   n.modelW = (std::max(width, 1) + 31) / 32 * 32;
   n.modelH = (std::max(height, 1) + 31) / 32 * 32;
@@ -39,6 +41,12 @@ VramNeed estimateVramNeed(bool fp8, int width, int height, int frames, bool resi
   }
   if (mps) {
     n.gb = kMpsBase + kMpsPerMpxFrame * mpx * n.modelFrames + kMargin;
+    return n;
+  }
+  if (streamed) {  // Windows port
+    n.gb = std::max(kStreamBase + kPerMpxFrame * mpx * n.modelFrames,
+                    kEncodeBase + kContext + kEncodePerMpxFrame * mpx * n.modelFrames) +
+           kPerMpxAboveHD * std::max(0.0, mpx - kHDMpx) + kMargin;
     return n;
   }
   n.gb = kBaseFp8 + (fp8 ? 0.0 : kBf16Extra) + kPerMpxFrame * mpx * n.modelFrames +

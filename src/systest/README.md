@@ -47,6 +47,13 @@ lines and "presses Cancel" when the test creates `<ui>/cancel`, so Cancel runs j
 cancel path. On macOS, job.py's failure dialog (osascript, absolute path) can't be faked: the
 test closes the ones it caused.
 
+**Windows** (the Windows port): `systestun_systest.ps1 -Tier fast -Bundle … -TestHost … -Work … -JobPython …`
+does the same. The isolated user folder is set through `USERPROFILE` (where `~` points there), and
+the fake window is `fake_ui.cpp`, built as `ltxag_fake_ui.exe` and put in a copy of the bundle in
+place of `ltxag_ui.exe`, so job.py opens it like the real one. The failure message goes through it
+too (`messages.log`). `mac_fp8_refused`, `no_apple_tools` and `file_permissions` skip on Windows.
+`build.ps1 -Systest` runs the fast tier.
+
 ## When
 
 - **Fast tier:** after every completed feature or fix, on both platforms

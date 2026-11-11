@@ -2,7 +2,9 @@
 
 Launched detached by the plugin's Download button (Setup tab). Standard library only: it runs
 with the system python3 (3.9 from the Command Line Tools) before any venv
-exists.
+exists. Windows port: Windows has no system Python, so there the plugin starts it with the uv it
+carries (`uv run --managed-python --python <pinned>`, $LTXAG_UV), which fetches the pinned Python
+into <D>/runtime first; this helper then uses that same uv and Python.
 
   python3 -I -B setup_helper.py --model-dir D --cache-root R [--existing E [--link]] [--no-ui]
   HF_TOKEN in the environment (decision 13: never on argv, never stored). Only needed when a
@@ -13,10 +15,13 @@ Steps (decisions 2/7/9/13/20/51), all pinned by model_manifest.json next to this
               `uv sync --frozen --no-dev --extra natten`, extra wheels (OpenColorIO), MPS smoke test
               (the darwin uv build; the natten extra is Linux-only in the lockfile's markers, so it
               installs nothing on a Mac; the command is kept as tested). CVT port (cvt1.17): Mac
-              only, upstream's CUDA smoke test and gcc check are gone
+              only, upstream's CUDA smoke test and gcc check are gone. Windows port: the win32 uv
+              build (a zip) unless $LTXAG_UV names one, the CUDA smoke test again (torch 2.13.0+cu132
+              from the lockfile; no Triton on Windows, so no C compiler is needed)
   2 models    for each file: already in <D> and verified -> keep; found by exact name under
               --existing and verified -> COPY (hashing while copying), or with --link a symlink to
-              it after hashing it in place (decision 66); else download from HF
+              it after hashing it in place (decision 66; Windows: a symlink needs Developer Mode or
+              admin rights, so a hard link when that fails, a copy when that fails too); else download from HF
               (hashing while downloading). Verification = size + SHA-256 from the manifest.
   3 fp16      macOS only (decision 68): if a matmul probe finds fp16 at least 1.2x faster than
               bf16 on this Mac, an fp16 copy of the transformer in <D> (also when the models are
@@ -41,6 +46,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKER_DIR = os.path.join(HERE, "..", "worker")
@@ -119,10 +125,10 @@ def stream_copy(src, dst_path: str, total: int, sha_expected: str, prog: Progres
                             f"{label}: {human(done)} of {human(total)} ({human(rate)}/s)")
                 last = time.time()
     if done != total or h.hexdigest() != sha_expected:
-        os.unlink(part)
+        oslayer.remove(part)
         raise SetupError(f"{os.path.basename(dst_path)}: size/hash mismatch "
                          f"({done} bytes, sha256 {h.hexdigest()[:16]}…)")
-    os.replace(part, dst_path)
+    oslayer.replace(part, dst_path)
 
 
 def dir_bytes(path: str) -> int:
@@ -238,11 +244,21 @@ def run(cmd: list[str], env: dict, label: str, prog: Progress, frac: float, cwd:
             time.sleep(10)
 
 
+def _stop(proc) -> None:  # noqa: ANN001 - subprocess.Popen
+    """Cancel: ends the step. Windows: with what it started (uv's own downloads and builds), which
+    killing uv alone leaves running there."""
+    if oslayer.WINDOWS:
+        oslayer.kill_tree(proc.pid)
+    else:
+        proc.kill()
+
+
 def _run_once(cmd: list[str], env: dict, label: str, prog: Progress, frac: float, cwd: str | None,
               watch: tuple | None = None) -> None:
     log.info(f"{label}: {' '.join(cmd)}")
     prog.update(frac, label)
-    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
     stop, cancelled = threading.Event(), threading.Event()
 
     def watcher() -> None:
@@ -252,7 +268,7 @@ def _run_once(cmd: list[str], env: dict, label: str, prog: Progress, frac: float
         while not stop.wait(2.0):
             if prog.cancelled():
                 cancelled.set()
-                proc.kill()
+                _stop(proc)
                 return
             if not watch:
                 continue
@@ -275,7 +291,7 @@ def _run_once(cmd: list[str], env: dict, label: str, prog: Progress, frac: float
             tail = (tail + [line])[-20:]
             log.debug(f"{label}: {line}")
             if prog.cancelled():
-                proc.kill()
+                _stop(proc)
                 raise Cancelled()
         proc.wait()
     finally:
@@ -299,7 +315,10 @@ def find_c_compiler() -> str:
     bridge on first use (mps_sdpa/_cpp/__init__.py, torch cpp_extension: clang++ + ninja) and the
     progress window is Swift (ltxag_worker/oslayer.py), so they are required. /usr/bin/clang is a
     stub even without them; xcrun finds the real tool or fails (man xcode-select). CVT port
-    (cvt1.17): Mac only, upstream's gcc check for Triton on Linux is gone."""
+    (cvt1.17): Mac only, upstream's gcc check for Triton on Linux is gone. Windows port: nothing
+    is compiled there (no Triton, no mps-sdpa; the windows are built with the plugin), so "-"."""
+    if oslayer.WINDOWS:
+        return "-"
     try:
         r = subprocess.run(["/usr/bin/xcrun", "--find", "clang++"], capture_output=True, text=True,
                            timeout=60)
@@ -315,20 +334,35 @@ def install_runtime(man: dict, rt: str, prog: Progress) -> str:
     for k in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX", "LD_LIBRARY_PATH"):
         env.pop(k, None)
     os.makedirs(f"{rt}/bin", exist_ok=True)
-    uv = f"{rt}/bin/uv"
+    uv = f"{rt}/bin/uv.exe" if oslayer.WINDOWS else f"{rt}/bin/uv"
     u = man["uv"]
-    asset = u["darwin"]  # cvt1.17: Mac only
-    if not (os.path.exists(uv) and subprocess.run([uv, "--version"], capture_output=True, text=True)
-            .stdout.split()[1:2] == [u["version"]]):
+    asset = u["win32" if oslayer.WINDOWS else "darwin"]  # cvt1.17: Mac only; Windows port: and Windows
+
+    def right_uv(path: str) -> bool:
+        return bool(path) and os.path.exists(path) and subprocess.run(
+            [path, "--version"], capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.split()[1:2] == [u["version"]]
+
+    # Windows port: the uv the plugin carries and started this helper with, when it is the pinned one.
+    if right_uv(os.environ.get("LTXAG_UV", "")):
+        uv = os.environ["LTXAG_UV"]
+        log.info(f"uv {u['version']}: the plugin's own ({uv})")
+    if not right_uv(uv):
         prog.update(0.01, f"runtime: downloading uv {u['version']}")
-        tgz = f"{rt}/bin/uv.tar.gz"
+        tgz = f"{rt}/bin/uv.zip" if oslayer.WINDOWS else f"{rt}/bin/uv.tar.gz"
         with urllib.request.urlopen(asset["url"], timeout=60) as resp:
             stream_copy(resp, tgz, asset["size"], asset["sha256"], prog, "uv", 0.01, 0.02)
-        with tarfile.open(tgz) as t:
-            for member in t.getmembers():
-                if os.path.basename(member.name) in ("uv", "uvx") and member.isfile():
-                    member.name = os.path.basename(member.name)
-                    t.extract(member, f"{rt}/bin")
+        if oslayer.WINDOWS:  # the Windows build is a zip with uv.exe at its top
+            with zipfile.ZipFile(tgz) as z:
+                for name in z.namelist():
+                    if os.path.basename(name) in ("uv.exe", "uvx.exe"):
+                        with z.open(name) as src, open(os.path.join(rt, "bin", os.path.basename(name)), "wb") as dst:
+                            shutil.copyfileobj(src, dst)
+        else:
+            with tarfile.open(tgz) as t:
+                for member in t.getmembers():
+                    if os.path.basename(member.name) in ("uv", "uvx") and member.isfile():
+                        member.name = os.path.basename(member.name)
+                        t.extract(member, f"{rt}/bin")
         os.unlink(tgz)
         log.info(f"uv {u['version']} installed (sha256 verified)")
     src = f"{rt}/ltx2"
@@ -359,13 +393,21 @@ def install_runtime(man: dict, rt: str, prog: Progress) -> str:
     # uv's own Python at the tested version, never a system one: LTX-2 only asks for >= 3.10, so a
     # system Python 3.12 got used on one user's machine, and its missing headers (no -devel
     # package) broke Triton's C build at the prompt cache step. uv's Python ships its headers.
-    cache_bytes = man["runtime"]["uv_cache_bytes_darwin"]
+    cache_bytes = man["runtime"]["uv_cache_bytes_win32" if oslayer.WINDOWS else "uv_cache_bytes_darwin"]
     run([uv, "sync", "--frozen", "--no-dev", "--extra", "natten", "--managed-python",
          "--python", man["runtime"]["python"]], env, "runtime: Python packages",
         prog, 0.05, cwd=src, retries=2, watch=(f"{rt}/uv-cache", cache_bytes, 0.08))
-    py = f"{src}/.venv/bin/python"
+    py = os.path.join(src, ".venv", "Scripts", "python.exe") if oslayer.WINDOWS else f"{src}/.venv/bin/python"
     run([uv, "pip", "install", "--python", py, *man["pip_extra"]], env, "runtime: installing OpenColorIO",
         prog, 0.08, retries=2)
+    if oslayer.WINDOWS:  # Windows port: CUDA, as upstream's Linux check (without the Triton part)
+        run([py, "-I", "-B", "-c",
+             "import sys, torch, PyOpenColorIO, ltx_pipelines.ic_lora; "
+             "assert torch.cuda.is_available(), 'no NVIDIA GPU that this PyTorch can use (CUDA): "
+             "an NVIDIA card and a current driver are needed'; "
+             "print(sys.version.split()[0], torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"],
+            env, "runtime: checking Python, torch + CUDA", prog, 0.09)
+        return py
     # Decision 65: PyTorch-MPS; the check touches no GPU memory.
     run([py, "-I", "-B", "-c",
          "import os, sys, sysconfig, torch, PyOpenColorIO, ltx_pipelines.ic_lora; "
@@ -375,6 +417,22 @@ def install_runtime(man: dict, rt: str, prog: Progress) -> str:
          "print(sys.version.split()[0], torch.__version__, 'MPS')"],
         env, "runtime: checking Python, torch + MPS", prog, 0.09)
     return py
+
+
+def link_to(source: str, dst: str) -> str:
+    """Puts a link to `source` at `dst`: "sym", or on Windows "hard" when a symlink is not allowed
+    (it needs Developer Mode or admin rights there) and both are on one drive, or "" for neither."""
+    try:
+        os.symlink(source, dst)
+        return "sym"
+    except OSError:
+        if not oslayer.WINDOWS:
+            raise
+    try:
+        os.link(source, dst)
+        return "hard"
+    except OSError:
+        return ""
 
 
 def gather_models(man: dict, model_dir: str, existing: str, token: str, prog: Progress,
@@ -410,9 +468,17 @@ def gather_models(man: dict, model_dir: str, existing: str, token: str, prog: Pr
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 if os.path.lexists(dst):  # a mismatching file or a dangling link from an earlier run
                     os.unlink(dst)
-                os.symlink(os.path.abspath(source), dst)
+                how = link_to(os.path.abspath(source), dst)
+                if not how:  # Windows: neither kind of link could be made
+                    log.warn(f"{name}: can't link on this PC (no Developer Mode, another drive); copying instead")
+                    with open(source, "rb") as src:
+                        stream_copy(src, dst, entry["size"], entry["sha256"], prog, f"{label} (copy)", f0, f1)
+                    mark_verified(dst, entry)
+                    summary["copied"].append(f"{name} from {source}")
+                    done += entry["size"]
+                    continue
                 mark_verified(dst, entry)
-                summary["linked"].append(f"{name} -> {source}")
+                summary["linked"].append(f"{name} -> {source}" + (" (hard link)" if how == "hard" else ""))
                 done += entry["size"]
                 continue
             log.warn(f"{name}: the existing copy is a different version; downloading instead")
@@ -513,11 +579,11 @@ def write_config(updates: dict) -> None:
     cfg.update(updates)
     os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
     tmp = CONFIG + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", newline="\n") as f:  # the same bytes on Windows as on the Mac
         f.write("# LTX Alpha Gen OFX user settings. Written by the plugin.\n")
         for k in sorted(cfg):
             f.write(f"{k}={cfg[k]}\n")
-    os.replace(tmp, CONFIG)
+    oslayer.replace(tmp, CONFIG)
 
 
 def main() -> int:
@@ -545,15 +611,17 @@ def main() -> int:
             raise SetupError("The Apple Command Line Tools are missing. The GPU code compiles a small "
                              "helper while it runs, so they are needed: run xcode-select --install in "
                              "Terminal. Then press Download again.")
-        log.info(f"C compiler (Command Line Tools): {cc}")
+        if not oslayer.WINDOWS:
+            log.info(f"C compiler (Command Line Tools): {cc}")
         os.makedirs(model_dir, exist_ok=True)
         py = a.ltx_python if a.skip_runtime else install_runtime(man, os.path.join(model_dir, "runtime"), prog)
         summary = gather_models(man, model_dir, a.existing, token, prog, link=a.link)
-        fp16_ready = make_fp16_copy(py, man, model_dir, prog)
+        # Decision 68: the fp16 copy is for Macs without fast bf16; an NVIDIA card has bf16 and fp8.
+        fp16_ready = make_fp16_copy(py, man, model_dir, prog) if sys.platform == "darwin" else None
         emb = os.path.join(a.cache_root, "prompt-empty.safetensors")
         worker = os.path.join(WORKER_DIR, "ltx_worker.py")
         m = {e["key"]: os.path.join(model_dir, e["path"]) for e in man["files"]}
-        run([py, "-I", "-B", worker, "--build-embeddings", emb, "--transformer", m["transformer"],
+        run([py, "-I", "-B", *(["-X", "utf8"] if oslayer.WINDOWS else []), worker, "--build-embeddings", emb, "--transformer", m["transformer"],
              "--text-encoder", m["text_encoder"], "--video-vae", m["video_vae"]],
             dict(os.environ), "building the prompt cache (loads Gemma once)", prog, 0.92)
         cfg = {"model_dir": model_dir, "ltx_python": py, "runtime_commit": man["ltx2"]["commit"],

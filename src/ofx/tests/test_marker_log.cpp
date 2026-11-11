@@ -1,6 +1,8 @@
 // Tests for the unprocessed-frame marker and the log line format / rotation.
+#ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -11,6 +13,7 @@
 
 #include "log.h"
 #include "marker.h"
+#include "test_os.h"
 
 using namespace ltxag;
 
@@ -107,9 +110,8 @@ int main() {
   }
 
   // Log: format, level filter, correlation ids, rotation.
-  char tmpl[] = "/tmp/ltxag_log_test_XXXXXX";
-  const std::string home = mkdtemp(tmpl);
-  setenv("HOME", home.c_str(), 1);
+  const std::string home = testTempDir("ltxag_log_test");
+  testSetHome(home);
   setenv("LTXAG_LOG_LEVEL", "info", 1);
   logConfigure();
   {
@@ -123,6 +125,7 @@ int main() {
   std::getline(in, l1);
   std::getline(in, l2);
   CHECK(!std::getline(in, l3), "debug line was written at info level");
+  in.close();  // Windows port: an open file can't be renamed there, and rotateLogs comes next
   CHECK(l1.find(" INFO  ofx[") == 23 && l1.find("node=node1234 job=job-1 | hello 42") != std::string::npos,
         "bad line: %s", l1.c_str());
   CHECK(l2.find(" WARN  ofx[") == 23 && l2.find("node=- job=- | outside scope") != std::string::npos,
@@ -136,6 +139,7 @@ int main() {
   std::ifstream fresh(logPath());
   std::string f1;
   std::getline(fresh, f1);
+  fresh.close();
   CHECK(f1.find("after rotation") != std::string::npos, "new log not started: %s", f1.c_str());
   for (int i = 0; i < 5; ++i) {
     LOGI("filler %d", i);
@@ -143,7 +147,7 @@ int main() {
   }
   CHECK(stat((logPath() + ".3").c_str(), &st) == 0, "rotation did not reach .3");
   CHECK(stat((logPath() + ".4").c_str(), &st) != 0, "kept more than 3 rotated files");
-  if (std::system(("rm -rf " + home).c_str()) != 0) std::fprintf(stderr, "cleanup failed\n");
+  testRemoveTree(home);
 
   if (failures) {
     std::fprintf(stderr, "%d failure(s)\n", failures);
