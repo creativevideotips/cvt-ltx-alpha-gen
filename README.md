@@ -25,8 +25,8 @@ These links download the files straight away. You won't find the installer in th
 - **Try Magic Mask first.** Resolve's Magic Mask is far faster, so use it first.
   When its matte isn't good enough, use LTX Alpha Gen for the more precise work.
 - **Mac with Apple Silicon, or a Windows PC with an NVIDIA card.** The Mac version is
-  the released one, and what this page describes. The Windows version is new, has no
-  installer yet and has not run the real model yet: see [Windows](#windows-nvidia).
+  the released one, and what this page describes. The Windows version is new and has no
+  installer yet: see [Windows](#windows-nvidia).
   There is no Linux version.
 - **macOS 15 (Sequoia) or later.** The plugin is built for macOS 15, and the installer
   will not install on an older macOS.
@@ -316,22 +316,29 @@ New in 1.50 and experimental. It is the same plugin, built for Windows 10 and 11
 running the model with PyTorch on an NVIDIA card (CUDA). There is no installer yet: you
 [build it from source](#build-from-source).
 
-**What has been tested** (Windows 11, RTX 4090 24 GB, Resolve Studio 21.2): it builds, the unit
-tests and the fast system test pass, Resolve loads it, and with the test worker (no model) Process,
-the cache, the matte in the viewer and Collect Logs work in Resolve. Setup installs the runtime
-(Python 3.14, PyTorch 2.13 for CUDA 13.2) and finds the GPU.
+**What has been tested** (one PC: Windows 11, RTX 4090 24 GB, 94 GB of memory, Resolve Studio
+21.2): Setup from start to finish (runtime, model download, prompt cache), and Process with the
+real model on Resolve's Fusion page, in fp8 with the weights kept in system memory, which is
+what Auto picks on a 24 GB card. On a synthetic clip whose true matte is known, the matte's mean
+error was 0.0058 (the Mac measured 0.0054).
 
-**What has not been tested yet:** the real model on Windows. That means the model download, and a
-real matte in any of the memory modes below. The memory estimates for Windows are worked out
-from upstream's Linux measurements, not measured. Fusion Studio and the Edit and Color pages are
-untested on Windows too. If you try it, **Collect Logs** has what is needed to fix what breaks.
+| Job (fp8, weights in system memory) | Time | Peak GPU memory |
+|---|---|---|
+| 120 HD frames in Resolve, 6 chunks of 33 | about 11.5 min (about 110 s a chunk) | 11.1 GB |
+| 17 HD frames in Resolve, 1 chunk | 78 s | 7.6 GB |
+| 17 frames at 768×512, outside Resolve | 50 s | 5.5 GB |
+
+**What has not been tested yet:** bf16, the weights on the GPU (a card with more memory) or read
+from disk, chunks longer than 33 frames, and real footage (the HD runs used a noise pattern, which
+shows that it runs, not how good the matte is). Fusion Studio and the Edit and Color pages are
+untested on Windows too. If something breaks, **Collect Logs** has what is needed to fix it.
 
 **What you need**
 
 - An NVIDIA card with a current driver. AMD and Intel cards can't run it.
 - GPU memory: the model's weights are about 42 GB (bf16) or about half that (fp8), so they only
   fit the largest cards. On smaller cards the plugin keeps them in system memory and sends them
-  to the GPU a layer at a time, so a 24 GB card should do (not yet measured). That needs about
+  to the GPU a layer at a time: that is how it was tested on a 24 GB card. It needs about
   26 GB of free system memory in fp8 or 48 GB in bf16; with less, they are read from disk, slowly.
 - About 85 GB of disk space for the models and the runtime.
 - Nothing else: no Python and no compiler. Setup brings its own Python.

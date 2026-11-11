@@ -64,7 +64,7 @@ def main() -> int:
     print("running:", " ".join(cmd), flush=True)
     t0 = time.time()
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True)
+                            text=True, errors="replace")  # Windows: library output in the PC's code page
     done, chunk_ids = False, []
     for line in proc.stdout:
         line = line.rstrip("\n")

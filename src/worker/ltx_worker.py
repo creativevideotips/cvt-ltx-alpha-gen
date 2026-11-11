@@ -598,7 +598,7 @@ def one_shot(a) -> int:  # noqa: ANN001
         sys.stdout.write(" ".join(str(p) for p in parts) + "\n")
         sys.stdout.flush()
 
-    threading.Thread(target=lambda: (sys.stdin.read(), os._exit(3)), daemon=True).start()
+    threading.Thread(target=lambda: (oslayer.wait_stdin_closed(), os._exit(3)), daemon=True).start()
     t0 = time.time()
     emit("info", f"python={sys.executable} {sys.version.split()[0]} pid={os.getpid()}")
     try:

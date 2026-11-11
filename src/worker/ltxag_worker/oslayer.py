@@ -312,3 +312,30 @@ def connect(sock_path: str, info: dict) -> socket.socket:
         s.close()
         raise
     return s
+
+
+def wait_stdin_closed() -> None:
+    """Returns when whoever started us has closed our stdin (it ended, or cancelled). On the Mac a
+    read to the end. On Windows a thread blocked in a read on a pipe makes the main thread hang
+    when it next loads a native library (the loader asks about the standard handles, and that
+    waits for the read): seen with the real worker, which hung at `import scipy` with no GPU
+    work started. So there the pipe is asked, twice a second, whether its other end is still
+    open."""
+    if WINDOWS:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.GetFileType.argtypes = [wintypes.HANDLE]
+        k.PeekNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                                    ctypes.c_void_p, ctypes.c_void_p]
+        try:
+            handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+        except (OSError, ValueError, AttributeError):
+            return  # no stdin at all
+        if k.GetFileType(handle) == 3:  # FILE_TYPE_PIPE
+            while k.PeekNamedPipe(handle, None, 0, None, None, None):
+                time.sleep(0.5)
+            return
+    sys.stdin.read()

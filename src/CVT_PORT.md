@@ -71,7 +71,8 @@ unchanged; what Windows needs is added beside them. Code changes are marked `Win
   takes the GPU when the estimate fits its free memory, else system memory when 26 GB (fp8) or
   48 GB (bf16) of it is free, else disk. A worker with another offload is restarted, like another
   precision. The Performance section shows on Windows (Precision, Model Loading). The estimate
-  for streamed weights (`vram_estimate.h`) is built from upstream's Linux fits and is UNVERIFIED.
+  for streamed weights (`vram_estimate.h`) is built from upstream's Linux fits; three runs on an
+  RTX 4090 came in 0.9 to 2.0 GB under it (listed there).
   The fixed decode budget (cvt1.32) and the fp16 copy stay Mac only.
 - **Setup.** Windows has no system Python: `build.ps1` puts the pinned `uv.exe` beside the .ofx
   (checked against the manifest's new `uv.win32` SHA-256), and Download runs
@@ -87,9 +88,19 @@ unchanged; what Windows needs is added beside them. Code changes are marked `Win
   bundle), `test_os.h` for the unit tests, `worker/tests/test_resident.py` (the worker's server and
   a client with the model faked, on both systems). `.github/workflows/build.yml` builds and runs
   the unit tests and the fast system test on macOS and Windows runners.
-- **Tested** on Windows 11, RTX 4090, Resolve Studio 21.2: unit tests, fast system test, loading
-  and a dummy-worker Process in Resolve, Setup up to the model download (runtime installed, CUDA
-  check passed). **Not tested:** the model download and the real model on Windows.
+- **Found with the real model** (and fixed): a venv's `python.exe` is a launcher on Windows, so the
+  worker's own pid is not the one job.py started; job.py waited its full 120 s for the info file
+  to name that pid before connecting (now an info file written since the start counts). And in
+  the worker's one-shot mode (the smoke tools) the thread that reads stdin to notice its parent's
+  end made the main thread hang at the next native library it loaded (`import scipy`), before
+  any GPU work: `oslayer.wait_stdin_closed` asks the pipe instead of reading it on Windows.
+- **Tested** on Windows 11, RTX 4090 24 GB, 94 GB RAM, Resolve Studio 21.2: unit tests, fast system
+  test, a dummy-worker Process in Resolve; Setup complete (runtime, 3 files downloaded and 3 kept,
+  all verified, prompt cache built in 85 s); the real model in fp8 with offload cpu: in Resolve
+  120 HD frames in 6 chunks of 33 (690 s in the worker, 108-131 s a chunk, peak reserved
+  11.1 GB) and 17 HD frames (78 s, 7.6 GB); `worker_smoke` 768x512x17 PASS, mean error 0.0058,
+  5.5 GB. **Not tested:** bf16, offload none and disk, chunks over 33 frames, real footage, Fusion
+  Studio, the Edit and Color pages.
 
 ## Changelog
 

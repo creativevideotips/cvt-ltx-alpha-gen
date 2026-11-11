@@ -446,7 +446,15 @@ class ResidentChannel:
             self.server_pid, self.proc = proc.pid, proc
             log.info(f"started resident worker pid {proc.pid}: " + " ".join(cmd))
             deadline = time.time() + 120
-            while time.time() < deadline and self._info().get("pid") != proc.pid:
+            started = time.time() - 1.0
+
+            def announced() -> bool:
+                # Windows port: a venv's python.exe is a launcher there, so the worker itself has
+                # another pid than the one started: an info file written since then is its own.
+                info = self._info()
+                return info.get("pid") == proc.pid or (oslayer.WINDOWS and info.get("time", 0) >= started)
+
+            while time.time() < deadline and not announced():
                 if proc.poll() is not None:
                     raise RuntimeError(f"worker exited at start (exit {proc.returncode}); see worker.out")
                 time.sleep(0.2)

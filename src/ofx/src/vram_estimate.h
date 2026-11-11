@@ -41,7 +41,10 @@
 //   need = max(6.0 + 0.0718 * Mpx * frames, 2.26 + 0.1088 * Mpx * frames)
 //          + 0.70 GB * max(0, Mpx - 2.09) + 1 GB; HD 33 -> 12.0, HD 73 -> 19.9, HD 145 -> 36.2.
 // The same for bf16 and fp8: the weights' size then counts against system memory, not the GPU.
-// UNVERIFIED: built from those two fits, not yet from a streamed run's own peak.
+// Built from those two fits. First streamed runs (RTX 4090 24 GB, Windows 11, torch 2.13.0+cu132,
+// fp8, offload cpu, 2026-11-11), peak reserved against this estimate: HD 33f 11.1 GB (11.9),
+// HD 17f 7.6 (9.6), 768x512 17f 5.5 (7.0). Cautious by 1-2 GB; bf16, offload disk and longer
+// chunks are not measured.
 #pragma once
 
 namespace ltxag {
